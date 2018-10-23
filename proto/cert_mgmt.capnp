@@ -3,6 +3,8 @@ using Go = import "go.capnp";
 $Go.package("proto");
 $Go.import("github.com/scionproto/scion/go/proto");
 
+using Sciond = import "sciond.capnp";
+
 struct CertChainReq {
     isdas @0 :UInt64;
     version @1 :UInt64;
@@ -29,6 +31,15 @@ struct TRCReq {
 
 struct TRC {
     trc @0 :Data;
+}
+
+struct PilaCertReq {
+    signedName @0 :Text;
+    endpointIdentifier @1 :Sciond.HostInfo;
+}
+
+struct PilaCertRep {
+    cert @0 :Data;
 }
 
 struct CertMgmt {
