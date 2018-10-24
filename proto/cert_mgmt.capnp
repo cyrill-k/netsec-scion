@@ -36,6 +36,7 @@ struct TRC {
 struct PilaCertReq {
     signedName @0 :Text;
     endpointIdentifier @1 :Sciond.HostInfo;
+    publicKey @2 :Data;
 }
 
 struct PilaCertRep {
@@ -51,5 +52,7 @@ struct CertMgmt {
         trc @4 :TRC;
         certChainIssReq @5 :CertChainIssReq;
         certChainIssRep @6 :CertChainIssRep;
+        pilaCertReq @7 :PilaCertReq;
+        pilaCertRep @8 :PilaCertRep;
     }
 }

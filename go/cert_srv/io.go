@@ -34,6 +34,7 @@ type Dispatcher struct {
 	stopped      chan struct{}
 	chainHandler *ChainHandler
 	trcHandler   *TRCHandler
+	pilaHandler  *PilaHandler
 	closed       bool
 }
 
@@ -50,6 +51,7 @@ func NewDispatcher(public, bind *snet.Addr) (*Dispatcher, error) {
 		stopped:      make(chan struct{}),
 		chainHandler: NewChainHandler(conn),
 		trcHandler:   NewTRCHandler(conn, public.IA),
+		pilaHandler:  NewPilaHandler(conn),
 	}
 	return d, nil
 }
@@ -113,6 +115,8 @@ func (d *Dispatcher) dispatch(addr *snet.Addr, buf common.RawBytes, config *conf
 			d.trcHandler.HandleRep(addr, pld.(*cert_mgmt.TRC), config)
 		case *cert_mgmt.TRCReq:
 			d.trcHandler.HandleReq(addr, pld.(*cert_mgmt.TRCReq), config)
+		case *cert_mgmt.PilaReq:
+			d.pilaHandler.HandleReq(addr, pld.(*cert_mgmt.PilaReq), config)
 		default:
 			return common.NewBasicError("Handler for cert_mgmt.pld not implemented", nil,
 				"protoID", pld.ProtoId())

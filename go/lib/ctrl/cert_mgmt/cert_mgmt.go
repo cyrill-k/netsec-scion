@@ -32,6 +32,8 @@ type union struct {
 	ChainIssRep *ChainIssRep `capnp:"certChainIssRep"`
 	TRCReq      *TRCReq      `capnp:"trcReq"`
 	TRCRep      *TRC         `capnp:"trc"`
+	PilaReq     *PilaReq     `capnp:"pilaCertReq"`
+	PilaRep     *PilaRep     `capnp:"pilaCertRep"`
 }
 
 func (u *union) set(c proto.Cerealizable) error {
@@ -54,6 +56,12 @@ func (u *union) set(c proto.Cerealizable) error {
 	case *TRC:
 		u.Which = proto.CertMgmt_Which_trc
 		u.TRCRep = p
+	case *PilaReq:
+		u.Which = proto.CertMgmt_Which_pilaCertReq
+		u.PilaReq = p
+	case *PilaRep:
+		u.Which = proto.CertMgmt_Which_pilaCertRep
+		u.PilaRep = p
 	default:
 		return common.NewBasicError("Unsupported cert mgmt union type (set)", nil,
 			"type", common.TypeOf(c))
@@ -75,6 +83,10 @@ func (u *union) get() (proto.Cerealizable, error) {
 		return u.TRCReq, nil
 	case proto.CertMgmt_Which_trc:
 		return u.TRCRep, nil
+	case proto.CertMgmt_Which_pilaCertReq:
+		return u.PilaReq, nil
+	case proto.CertMgmt_Which_pilaCertRep:
+		return u.PilaRep, nil
 	}
 	return nil, common.NewBasicError("Unsupported cert mgmt union type (get)", nil, "type", u.Which)
 }
