@@ -30,8 +30,8 @@ type PilaRep struct {
 	RawCert common.RawBytes `capnp:"cert"`
 }
 
-func (c *PilaRep) Cert() (*cert.Certificate, error) {
-	return cert.CertificateFromRaw(c.RawCert)
+func (c *PilaRep) PilaChain() (*cert.PilaChain, error) {
+	return cert.PilaChainFromRaw(c.RawCert)
 }
 
 func (c *PilaRep) ProtoId() proto.ProtoIdType {
@@ -39,7 +39,7 @@ func (c *PilaRep) ProtoId() proto.ProtoIdType {
 }
 
 func (c *PilaRep) String() string {
-	crt, err := c.Cert()
+	crt, err := c.PilaChain()
 	if err != nil {
 		return fmt.Sprintf("Invalid certificate: %v", err)
 	}

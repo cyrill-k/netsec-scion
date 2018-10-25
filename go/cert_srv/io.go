@@ -51,7 +51,7 @@ func NewDispatcher(public, bind *snet.Addr) (*Dispatcher, error) {
 		stopped:      make(chan struct{}),
 		chainHandler: NewChainHandler(conn),
 		trcHandler:   NewTRCHandler(conn, public.IA),
-		pilaHandler:  NewPilaHandler(conn),
+		pilaHandler:  NewPilaHandler(conn, public.IA),
 	}
 	return d, nil
 }
