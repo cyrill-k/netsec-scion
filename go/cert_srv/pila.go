@@ -21,7 +21,6 @@ import (
 
 	"github.com/scionproto/scion/go/cert_srv/conf"
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/crypto"
 	"github.com/scionproto/scion/go/lib/crypto/cert"
 	"github.com/scionproto/scion/go/lib/ctrl"
 	"github.com/scionproto/scion/go/lib/ctrl/cert_mgmt"
@@ -61,12 +60,16 @@ func (h *PilaHandler) HandleReq(a *snet.Addr, req *cert_mgmt.PilaReq, config *co
 		return
 	}
 
+	log.Info("after prepareCertificate", "cert", cert)
+
 	if err := h.signCertificate(a, cert, config); err != nil {
 		log.Error("Failed to sign certificate",
 			"cert", cert,
 			"err", err)
 		return
 	}
+
+	log.Info("after signCertificate", "cert", cert)
 
 	// combine core cert, leaf cert & endpoint cert into json object
 	chain, err := h.combineCertificates(a, cert, config)
@@ -75,6 +78,8 @@ func (h *PilaHandler) HandleReq(a *snet.Addr, req *cert_mgmt.PilaReq, config *co
 			"err", err)
 		return
 	}
+
+	log.Info("after combineCertificate", "chain", chain)
 
 	if err := h.sendRepPilaChain(a, chain); err != nil {
 		log.Error("Failed to send reply",
@@ -129,7 +134,7 @@ func (h *PilaHandler) prepareCertificate(a *snet.Addr, req *cert_mgmt.PilaReq, c
 		//SubjectEncKey: nil
 		SubjectSignKey: req.RawPublicKey,
 		TRCVersion:     h.getTRCVersion(a, config),
-		Version:        0}, nil
+		Version:        1}, nil
 }
 
 func (h *PilaHandler) getTRCVersion(a *snet.Addr, config *conf.Conf) uint64 {

@@ -248,7 +248,7 @@ func (c *PilaCertificate) Copy() *PilaCertificate {
 }
 
 func (c *PilaCertificate) String() string {
-	return fmt.Sprintf("PilaCertificate %sv%d", c.Subject, c.Version)
+	return fmt.Sprintf("PilaCertificate = {Subject = \"%+v\", Version = \"%+v\", CanIssue = \"%+v\", Comment = \"%+v\", EncAlgorithm = \"%+v\", SubjectEncKey = \"%+v\", ExpirationTime = \"%+v\", Issuer = \"%+v\", IssuingTime = \"%+v\", SignAlgorithm = \"%+v\", SubjectSignKey = \"%+v\", TRCVersion = \"%+v\"}", c.Subject, c.Version, c.CanIssue, c.Comment, c.EncAlgorithm, c.SubjectEncKey, time.Unix(int64(c.ExpirationTime), 0), c.Issuer, time.Unix(int64(c.IssuingTime), 0), c.SignAlgorithm, c.SubjectSignKey, c.TRCVersion)
 }
 
 func (c *PilaCertificate) JSON(indent bool) ([]byte, error) {
