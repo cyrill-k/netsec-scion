@@ -123,9 +123,9 @@ func (h *PilaHandler) prepareCertificate(a *snet.Addr, req *cert_mgmt.PilaReq, c
 		Comment:  req.SignedName,
 		// This signature does not support encryption
 		//EncAlgorithm: ""
-		ExpirationTime: issuingTime,
+		ExpirationTime: expirationTime,
 		Issuer:         a.IA,
-		IssuingTime:    expirationTime,
+		IssuingTime:    issuingTime,
 		SignAlgorithm:  signAlgorithm,
 		// set afterwards
 		//Signature: nil
