@@ -40,7 +40,9 @@ func NewPilaHandler(conn *snet.Conn, ia addr.IA) *PilaHandler {
 // HandleReq handles endpoint certificate requests. A certificate server authenticates the client
 // and grants the certificate for the given IP address if it is valid.
 func (h *PilaHandler) HandleReq(a *snet.Addr, req *cert_mgmt.PilaReq, config *conf.Conf) {
-	log.Info("Received PILA certificate request", "addr", a, "req", req)
+	log.Info("Received PILA certificate request",
+		"addr", a,
+		"req", req)
 	if !a.Host.IP().Equal(req.EndpointIdentifier.Host().IP()) {
 		log.Info("PILA request IP address and src IP address are not identical",
 			"req", req.EndpointIdentifier.Host().IP(),
@@ -60,16 +62,12 @@ func (h *PilaHandler) HandleReq(a *snet.Addr, req *cert_mgmt.PilaReq, config *co
 		return
 	}
 
-	log.Info("after prepareCertificate", "cert", cert)
-
 	if err := h.signCertificate(a, cert, config); err != nil {
 		log.Error("Failed to sign certificate",
 			"cert", cert,
 			"err", err)
 		return
 	}
-
-	log.Info("after signCertificate", "cert", cert)
 
 	// combine core cert, leaf cert & endpoint cert into json object
 	chain, err := h.combineCertificates(a, cert, config)
@@ -78,8 +76,6 @@ func (h *PilaHandler) HandleReq(a *snet.Addr, req *cert_mgmt.PilaReq, config *co
 			"err", err)
 		return
 	}
-
-	log.Info("after combineCertificate", "chain", chain)
 
 	if err := h.sendRepPilaChain(a, chain); err != nil {
 		log.Error("Failed to send reply",
@@ -110,6 +106,7 @@ func (h *PilaHandler) prepareCertificate(a *snet.Addr, req *cert_mgmt.PilaReq, c
 		return nil, errors.New("Error parsing certificate duration: " + err.Error())
 	}
 	issuingTime := uint64(time.Now().Unix())
+
 	expirationTime := issuingTime + uint64(validityPeriod.Seconds())
 	var signAlgorithm string
 	switch req.RawPublicKey.Len() {

@@ -17,13 +17,7 @@ import (
 	"github.com/scionproto/scion/go/lib/util"
 )
 
-// type PilaCertificateEntity interface {
-// 	MarshalText() ([]byte, error)
-// 	UnmarshalText(text []byte) error
-// 	Eq(o PilaCertificateEntity) bool
-// }
-
-// todo(cyrill): add type byte to allow different implementation of subject
+// todo(cyrill): Add different entity implementations (e.g. ISD+AS+IP)
 type PilaCertificateEntity struct {
 	Ipv4 net.IP
 }
