@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,11 +25,13 @@ import (
 	"github.com/scionproto/scion/go/border/conf"
 	"github.com/scionproto/scion/go/border/metrics"
 	"github.com/scionproto/scion/go/border/rcmn"
+	"github.com/scionproto/scion/go/border/rctrl"
 	"github.com/scionproto/scion/go/border/rctx"
 	"github.com/scionproto/scion/go/border/rpkt"
 	"github.com/scionproto/scion/go/lib/assert"
 	"github.com/scionproto/scion/go/lib/log"
 	"github.com/scionproto/scion/go/lib/ringbuf"
+	_ "github.com/scionproto/scion/go/lib/scrypto" // Make sure math/rand is seeded
 )
 
 const processBufCnt = 128
@@ -52,8 +55,6 @@ type Router struct {
 	freePkts *ringbuf.Ring
 	// sRevInfoQ is a channel for handling SignedRevInfo payloads.
 	sRevInfoQ chan rpkt.RawSRevCallbackArgs
-	// iFID is a channel for handling IFID packets from the local BS
-	ifIDQ chan rpkt.IFIDCallbackArgs
 	// pktErrorQ is a channel for handling packet errors
 	pktErrorQ chan pktErrorArgs
 }
@@ -70,11 +71,18 @@ func NewRouter(id, confDir string) (*Router, error) {
 // Run sets up networking, and starts go routines for handling the main packet
 // processing as well as various other router functions.
 func (r *Router) Run() error {
-	go r.IFStateUpdate()
-	go r.RevInfoFwd()
-	go r.IFIDFwd()
-	go r.PacketError()
-	go r.confSig()
+	go func() {
+		defer log.LogPanicAndExit()
+		r.PacketError()
+	}()
+	go func() {
+		defer log.LogPanicAndExit()
+		r.confSig()
+	}()
+	go func() {
+		defer log.LogPanicAndExit()
+		rctrl.Control(r.sRevInfoQ)
+	}()
 	// TODO(shitz): Here should be some code to periodically check the discovery
 	// service for updated info.
 	var wait chan struct{}
@@ -84,7 +92,6 @@ func (r *Router) Run() error {
 
 // confSig handles reloading the configuration when SIGHUP is received.
 func (r *Router) confSig() {
-	defer log.LogPanicAndExit()
 	for range sighup {
 		var err error
 		var config *conf.Conf
@@ -124,12 +131,15 @@ func (r *Router) handleSock(s *rctx.Sock, stop, stopped chan struct{}) {
 // everything from parsing the incoming packet, to routing the outgoing packet.
 func (r *Router) processPacket(rp *rpkt.RtrPkt) {
 	if assert.On {
-		assert.Must(len(rp.Raw) > 0, "Raw must not be empty")
 		assert.Must(rp.DirFrom != rcmn.DirUnset, "DirFrom must be set")
 		assert.Must(rp.Ingress.Dst != nil, "Ingress.Dst must be set")
 		assert.Must(rp.Ingress.Src != nil, "Ingress.Src must be set")
-		assert.Must(len(rp.Ingress.IfIDs) > 0, "Ingress.IfIDs must not be empty")
 		assert.Must(rp.Ctx != nil, "Context must be set")
+		if rp.DirFrom == rcmn.DirLocal {
+			assert.Must(rp.Ingress.IfID == 0, "Ingress.IfID must not be set for DirFrom==DirLocal")
+		} else {
+			assert.Must(rp.Ingress.IfID > 0, "Ingress.IfID must be set for DirFrom==DirExternal")
+		}
 	}
 	// Assign a pseudorandom ID to the packet, for correlating log entries.
 	rp.Id = log.RandId(4)
@@ -142,8 +152,12 @@ func (r *Router) processPacket(rp *rpkt.RtrPkt) {
 	}
 	// Validation looks for errors in the packet that didn't break basic
 	// parsing.
-	if err := rp.Validate(); err != nil {
+	valid, err := rp.Validate()
+	if err != nil {
 		r.handlePktError(rp, err, "Error validating packet")
+		return
+	}
+	if !valid {
 		return
 	}
 	// Check if the packet needs to be processed locally, and if so register
@@ -160,17 +174,13 @@ func (r *Router) processPacket(rp *rpkt.RtrPkt) {
 		rp.Error("Error parsing payload", "err", err)
 		return
 	}
-	// Process the packet, if a previous step has registered a relevant hook
-	// for doing so.
+	// Process the packet, if a previous step has registered a relevant hook for doing so.
 	if err := rp.Process(); err != nil {
 		r.handlePktError(rp, err, "Error processing packet")
 		return
 	}
-	// If the packet's destination is this router, there's no need to forward
-	// it.
-	if rp.DirTo != rcmn.DirSelf {
-		if err := rp.Route(); err != nil {
-			r.handlePktError(rp, err, "Error routing packet")
-		}
+	// Forward the packet. Packets destined to self are forwarded to the local dispatcher.
+	if err := rp.Route(); err != nil {
+		r.handlePktError(rp, err, "Error routing packet")
 	}
 }

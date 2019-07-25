@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ import (
 	"github.com/scionproto/scion/go/lib/infra/disp"
 	"github.com/scionproto/scion/go/lib/infra/messenger"
 	"github.com/scionproto/scion/go/lib/infra/modules/trust"
-	"github.com/scionproto/scion/go/lib/infra/modules/trust/trustdb"
+	"github.com/scionproto/scion/go/lib/infra/modules/trust/trustdb/trustdbsqlite"
 	"github.com/scionproto/scion/go/lib/log"
 	"github.com/scionproto/scion/go/lib/snet/rpt"
 	"github.com/scionproto/scion/go/lib/xtest"
@@ -42,11 +42,14 @@ func main() {
 	// Initialize networking and modules
 	serverApp := InitDefaultNetworking(s2c)
 	// Initialize Server
-	serverApp.messenger.AddHandler(messenger.ChainRequest,
+	serverApp.messenger.AddHandler(infra.ChainRequest,
 		serverApp.trustStore.NewChainReqHandler(false))
-	serverApp.messenger.AddHandler(messenger.TRCRequest,
+	serverApp.messenger.AddHandler(infra.TRCRequest,
 		serverApp.trustStore.NewTRCReqHandler(false))
-	go serverApp.messenger.ListenAndServe()
+	go func() {
+		defer log.LogPanicAndExit()
+		serverApp.messenger.ListenAndServe()
+	}()
 	// Do work
 	select {}
 }
@@ -66,18 +69,26 @@ func InitDefaultNetworking(conn net.PacketConn) *ExampleServerApp {
 	// Initialize message dispatcher
 	dispatcherLayer := disp.New(transportLayer, messenger.DefaultAdapter, log.New("name", "server"))
 	// Initialize TrustStore
-	db, err := trustdb.New(randomFileName())
+	db, err := trustdbsqlite.New(randomFileName())
 	if err != nil {
 		log.Error("Unable to initialize trustdb", "err", err)
 		os.Exit(-1)
 	}
-	server.trustStore, err = trust.NewStore(db, xtest.MustParseIA("1-ff00:0:1"), 0, log.Root())
+	server.trustStore, err = trust.NewStore(db, xtest.MustParseIA("1-ff00:0:1"), nil, log.Root())
 	if err != nil {
 		log.Error("Unable to create trust store", "err", err)
 		os.Exit(-1)
 	}
 	// Initialize messenger with verification capabilities (trustStore-backed)
-	server.messenger = messenger.New(dispatcherLayer, server.trustStore, log.Root())
+	server.messenger = messenger.New(
+		xtest.MustParseIA("1-ff00:0:1"),
+		dispatcherLayer,
+		server.trustStore,
+		log.Root(),
+		&messenger.Config{
+			DisableSignatureVerification: true,
+		},
+	)
 	// Enable network access for trust store request handling
 	server.trustStore.SetMessenger(server.messenger)
 	return server

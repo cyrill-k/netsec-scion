@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,9 +16,12 @@
 package query
 
 import (
+	"time"
+
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/seg"
+	"github.com/scionproto/scion/go/proto"
 )
 
 // TODO(shitz): This should be moved when we have hidden path sets.
@@ -34,19 +38,40 @@ var NullHpCfgID = HPCfgID{IA: addr.IAInt(0).IA(), ID: 0}
 
 type IntfSpec struct {
 	IA   addr.IA
-	IfID uint64
+	IfID common.IFIDType
 }
 
 type Params struct {
-	SegID    common.RawBytes
-	SegTypes []seg.Type
-	HpCfgIDs []*HPCfgID
-	Intfs    []*IntfSpec
-	StartsAt []addr.IA
-	EndsAt   []addr.IA
+	SegIDs        []common.RawBytes
+	SegTypes      []proto.PathSegType
+	HpCfgIDs      []*HPCfgID
+	Intfs         []*IntfSpec
+	StartsAt      []addr.IA
+	EndsAt        []addr.IA
+	MinLastUpdate *time.Time
 }
 
 type Result struct {
-	Seg      *seg.PathSegment
-	HpCfgIDs []*HPCfgID
+	Seg        *seg.PathSegment
+	LastUpdate time.Time
+	HpCfgIDs   []*HPCfgID
 }
+
+// Results is a type for convenience methods on a slice of Results.
+type Results []*Result
+
+// Segs returns the segments in the Results slice.
+func (r Results) Segs() seg.Segments {
+	segs := make(seg.Segments, len(r))
+	for i, r := range r {
+		segs[i] = r.Seg
+	}
+	return segs
+}
+
+// ByLastUpdate implements the sort.Interface to sort results by LastUpdate time stamp.
+type ByLastUpdate Results
+
+func (r ByLastUpdate) Len() int           { return len(r) }
+func (r ByLastUpdate) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+func (r ByLastUpdate) Less(i, j int) bool { return r[i].LastUpdate.Before(r[j].LastUpdate) }

@@ -17,6 +17,7 @@
 package pathmgr
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"time"
@@ -45,14 +46,15 @@ func ExamplePR() {
 	}
 	// Initialize path resolver
 	sciondPath := sciond.GetDefaultSCIONDPath(&src)
-	sciondService := sciond.NewService(sciondPath)
-	pr, err := New(sciondService, time.Second, time.Minute, log.Root())
+	sciondService := sciond.NewService(sciondPath, true)
+	sciondConn, err := sciondService.Connect()
 	if err != nil {
 		fmt.Println("Failed to connect to SCIOND", "err", err)
 		return
 	}
+	pr := New(sciondConn, Timers{}, log.Root())
 	// Register source and destination
-	sp, err := pr.Watch(src, dst)
+	sp, err := pr.Watch(context.Background(), src, dst)
 	if err != nil {
 		fmt.Println("Failed to register", "err", err)
 	}

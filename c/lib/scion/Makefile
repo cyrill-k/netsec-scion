@@ -4,6 +4,10 @@ CC = clang
 CFLAGS ?= -Wall -Werror -g -fPIC -O2
 LDFLAGS ?= -shared -Wl,-z,defs
 
+ifeq ($(D),1)
+CFLAGS += -gdwarf-2 -O0
+endif
+
 SRCS = $(filter-out $(BINARY).c, $(wildcard *.c))
 OBJS = $(SRCS:.c=.o)
 STATIC = libscion.a
@@ -35,11 +39,13 @@ checksum_bench: checksum_bench.c $(DYNAMIC)
 install: .installstamp
 
 .installstamp: $(TARGETS)
+	@sudo -p "c/lib/scion:install [sudo] password for %p: " true
 	sudo cp $(TARGETS) $(PREFIX)/lib/
 	sudo ldconfig
 	touch .installstamp
 
 uninstall:
+	@sudo -p "c/lib/scion:uninstall [sudo] password for %p: " true
 	$(foreach var,$(TARGETS),sudo rm -f $(PREFIX)/lib/$(var);)
 	sudo ldconfig
 	rm -f .installstamp

@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +17,7 @@ package addr
 
 import (
 	"encoding"
+	"flag"
 	"fmt"
 	"strconv"
 	"strings"
@@ -133,7 +135,7 @@ func (as AS) FileFmt() string {
 
 func (as AS) fmt(sep byte) string {
 	if as > MaxAS {
-		return fmt.Sprintf("%d [Illegal AS: larger than %d]", as, MaxAS)
+		return fmt.Sprintf("%d [Illegal AS: larger than %d]", as, AS(MaxAS))
 	}
 	// Format BGP ASes as decimal
 	if as <= MaxBGPAS {
@@ -155,6 +157,7 @@ func (as AS) fmt(sep byte) string {
 
 var _ fmt.Stringer = IA{}
 var _ encoding.TextUnmarshaler = (*IA)(nil)
+var _ flag.Value = (*IA)(nil)
 
 // IA represents the ISD (ISolation Domain) and AS (Autonomous System) Id of a given SCION AS.
 type IA struct {
@@ -208,6 +211,10 @@ func (ia IA) MarshalText() ([]byte, error) {
 
 // allows IA to be used as a map key in JSON.
 func (ia *IA) UnmarshalText(text []byte) error {
+	if len(text) == 0 {
+		*ia = IA{}
+		return nil
+	}
 	newIA, err := IAFromString(string(text))
 	if err != nil {
 		return err
@@ -236,10 +243,18 @@ func (ia IA) Eq(other IA) bool {
 	return ia.I == other.I && ia.A == other.A
 }
 
+// IsWildcard returns whether the ia has a wildcard part (isd or as).
+func (ia IA) IsWildcard() bool {
+	return ia.I == 0 || ia.A == 0
+}
+
 func (ia IA) String() string {
 	return fmt.Sprintf("%d-%s", ia.I, ia.A)
 }
 
+// FileFmt returns a file-system friendly representation of ia. If prefixes is
+// true, the format will be in the form of ISD%d-AS%d. If it is false, the
+// format is just %d-%d.
 func (ia IA) FileFmt(prefixes bool) string {
 	fmts := "%d-%s"
 	if prefixes {
@@ -248,9 +263,23 @@ func (ia IA) FileFmt(prefixes bool) string {
 	return fmt.Sprintf(fmts, ia.I, ia.A.FileFmt())
 }
 
+// This method implements flag.Value interface
+func (ia *IA) Set(s string) error {
+	pIA, err := IAFromString(s)
+	if err != nil {
+		return err
+	}
+	*ia = pIA
+	return nil
+}
+
 // IAInt is an integer representation of an ISD-AS.
 type IAInt uint64
 
 func (iaI IAInt) IA() IA {
 	return IA{I: ISD(iaI >> ASBits), A: AS(iaI & MaxAS)}
+}
+
+func (iaI IAInt) String() string {
+	return iaI.IA().String()
 }

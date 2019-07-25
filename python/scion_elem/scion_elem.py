@@ -33,39 +33,31 @@ import lib.app.sciond as lib_sciond
 from lib.config import Config
 from lib.crypto.certificate_chain import verify_chain_trc
 from lib.errors import SCIONParseError, SCIONVerificationError
-from lib.flagtypes import TCPFlags
 from lib.defines import (
     AS_CONF_FILE,
-    BEACON_SERVICE,
-    CERTIFICATE_SERVICE,
     GEN_CACHE_PATH,
-    PATH_SERVICE,
+    REVOCATION_GRACE,
     SCION_UDP_EH_DATA_PORT,
-    SCIOND_API_SOCKDIR,
-    SERVICE_TYPES,
-    SIBRA_SERVICE,
     STARTUP_QUIET_PERIOD,
-    TCP_ACCEPT_POLLING_TOUT,
     TOPO_FILE,
 )
 from lib.errors import (
     SCIONBaseError,
     SCIONChecksumFailed,
-    SCIONTCPError,
-    SCIONTCPTimeout,
+    SCIONIOError,
     SCIONServiceLookupError,
 )
 from lib.log import log_exception
 from lib.msg_meta import (
     SCMPMetadata,
     SockOnlyMetadata,
-    TCPMetadata,
     UDPMetadata,
 )
 from lib.packet.cert_mgmt import (
     CertMgmt,
     CertChainReply,
     CertChainRequest,
+    CertRequestState,
     TRCReply,
     TRCRequest,
 )
@@ -74,15 +66,13 @@ from lib.packet.ext.one_hop_path import OneHopPathExt
 from lib.packet.host_addr import HostAddrNone
 from lib.packet.packet_base import PayloadRaw
 from lib.packet.path import SCIONPath
-from lib.packet.path_mgmt.rev_info import (
-    SignedRevInfoCertFetchError,
-    RevInfoExpiredError
-)
+from lib.packet.path_mgmt.rev_info import RevInfoExpiredError
 from lib.packet.scion import (
     SCIONBasePacket,
     SCIONL4Packet,
     build_base_hdrs,
 )
+from lib.packet.signed_util import DefaultSignSrc
 from lib.packet.svc import SVC_TO_SERVICE, SERVICE_TO_SVC_A
 from lib.packet.scion_addr import SCIONAddr
 from lib.packet.scion_udp import SCIONUDPHeader
@@ -102,11 +92,10 @@ from lib.packet.scmp.errors import (
 )
 from lib.packet.scmp.types import SCMPClass
 from lib.packet.scmp.util import scmp_type_name
-from lib.socket import ReliableSocket, SocketMgr, TCPSocketWrapper
-from lib.tcp.socket import SCIONTCPSocket, SockOpt
+from lib.socket import ReliableSocket, SocketMgr
 from lib.thread import thread_safety_net, kill_self
 from lib.trust_store import TrustStore
-from lib.types import AddrType, L4Proto, PayloadClass
+from lib.types import AddrType, L4Proto, PayloadClass, ServiceType
 from lib.topology import Topology
 from lib.util import hex_str, sleep_interval
 
@@ -129,7 +118,7 @@ CONNECTED_TO_DISPATCHER = Gauge(
     "Is the element successfully registered with the dispatcher.",
     ["server_id", "isd_as"])
 
-MAX_QUEUE = 50
+MAX_QUEUE = 5000
 # Timeout for API path requests
 API_TOUT = 1
 
@@ -147,12 +136,11 @@ class SCIONElement(object):
     """
     SERVICE_TYPE = None
     STARTUP_QUIET_PERIOD = STARTUP_QUIET_PERIOD
-    USE_TCP = False
     # Timeout for TRC or Certificate requests.
     TRC_CC_REQ_TIMEOUT = 3
 
     def __init__(self, server_id, conf_dir, public=None, bind=None, spki_cache_dir=GEN_CACHE_PATH,
-                 prom_export=None):
+                 prom_export=None, sciond_path=None):
         """
         :param str server_id: server identifier.
         :param str conf_dir: configuration directory.
@@ -168,6 +156,8 @@ class SCIONElement(object):
         :param str prom_export:
             String of the form 'addr:port' specifying the prometheus endpoint.
             If no string is provided, no metrics are exported.
+        :param str sciond_path:
+            String that specifies the location of sciond's socket.
         """
         self.id = server_id
         self.conf_dir = conf_dir
@@ -178,6 +168,7 @@ class SCIONElement(object):
         self._labels = {"server_id": self.id, "isd_as": str(self.topology.isd_as)}
         # Must be over-ridden by child classes:
         self.CTRL_PLD_CLASS_MAP = {}
+        self.CTRL_PLD_CLASS_FAST_MAP = {}
         self.SCMP_PLD_CLASS_MAP = {}
         self.public = public
         self.bind = bind
@@ -200,24 +191,25 @@ class SCIONElement(object):
         self._in_buf = queue.Queue(MAX_QUEUE)
         self._socks = SocketMgr()
         self._startup = time.time()
-        if self.USE_TCP:
-            self._DefaultMeta = TCPMetadata
-        else:
-            self._DefaultMeta = UDPMetadata
+        self._DefaultMeta = UDPMetadata
         self.unverified_segs = ExpiringDict(500, 60 * 60)
         self.unv_segs_lock = threading.RLock()
         self.requested_trcs = {}
-        self.req_trcs_lock = threading.Lock()
+        self.req_trcs_lock = threading.RLock()
         self.requested_certs = {}
-        self.req_certs_lock = threading.Lock()
-        # TODO(jonghoonkwon): Fix me to setup sockets for multiple public addresses
-        host_addr, self._port = self.public[0]
+        self.req_certs_lock = threading.RLock()
+        # new cert/trc fetching implementation
+        self.unv_certs = {}
+        self.unv_certs_lock = threading.RLock()
+        self.cert_reqs = defaultdict(list)
+        self.cert_reqs_lock = threading.Lock()
+        host_addr, self._port = self.public
         self.addr = SCIONAddr.from_values(self.topology.isd_as, host_addr)
         if prom_export:
             self._export_metrics(prom_export)
             self._init_metrics()
         self._setup_sockets(True)
-        lib_sciond.init(os.path.join(SCIOND_API_SOCKDIR, "sd%s.sock" % self.addr.isd_as.file_fmt()))
+        lib_sciond.init(sciond_path)
 
     def _load_as_conf(self):
         return Config.from_file(os.path.join(self.conf_dir, AS_CONF_FILE))
@@ -226,19 +218,13 @@ class SCIONElement(object):
         """
         Setup incoming socket and register with dispatcher
         """
-        self._tcp_sock = None
-        self._tcp_new_conns = queue.Queue(MAX_QUEUE)  # New TCP connections.
         if self._port is None:
             # No scion socket desired.
             return
         svc = SERVICE_TO_SVC_A.get(self.SERVICE_TYPE)
-        # Setup TCP "accept" socket.
-        self._setup_tcp_accept_socket(svc)
         # Setup UDP socket
         if self.bind:
-            # TODO(jonghoonkwon): Fix me to setup socket for a proper bind address,
-            # if the element has more than one bind addresses
-            host_addr, b_port = self.bind[0]
+            host_addr, b_port = self.bind
             b_addr = SCIONAddr.from_values(self.topology.isd_as, host_addr)
             self._udp_sock = ReliableSocket(
                 reg=(self.addr, self._port, init, svc), bind_ip=(b_addr, b_port))
@@ -252,25 +238,6 @@ class SCIONElement(object):
             CONNECTED_TO_DISPATCHER.labels(**self._labels).set(1)
         self._port = self._udp_sock.port
         self._socks.add(self._udp_sock, self.handle_recv)
-
-    def _setup_tcp_accept_socket(self, svc):
-        if not self.USE_TCP:
-            return
-        MAX_TRIES = 40
-        for i in range(MAX_TRIES):
-            try:
-                self._tcp_sock = SCIONTCPSocket()
-                self._tcp_sock.setsockopt(SockOpt.SOF_REUSEADDR)
-                self._tcp_sock.set_recv_tout(TCP_ACCEPT_POLLING_TOUT)
-                self._tcp_sock.bind((self.addr, self._port), svc=svc)
-                self._tcp_sock.listen()
-                break
-            except SCIONTCPError as e:
-                logging.warning("TCP: Cannot connect to LWIP socket: %s" % e)
-            time.sleep(1)  # Wait for dispatcher
-        else:
-            logging.critical("TCP: cannot init TCP socket.")
-            kill_self()
 
     def init_ifid2br(self):
         for br in self.topology.border_routers:
@@ -298,8 +265,7 @@ class SCIONElement(object):
 
     def get_border_addr(self, ifid):
         br = self.ifid2br[ifid]
-        addr_idx = br.interfaces[ifid].addr_idx
-        br_addr, br_port = br.int_addrs[addr_idx].public[0]
+        br_addr, br_port = br.int_addrs.public
         return br_addr, br_port
 
     def handle_msg_meta(self, msg, meta):
@@ -328,6 +294,7 @@ class SCIONElement(object):
             start = time.time()
             self._check_cert_reqs()
             self._check_trc_reqs()
+            self._check_cert_req_states()
             sleep_interval(start, check_cyle, "Elem._check_trc_cert_reqs cycle")
 
     def _check_trc_reqs(self):
@@ -339,14 +306,24 @@ class SCIONElement(object):
             for (isd, ver), (req_time, meta) in self.requested_trcs.items():
                 if now - req_time >= self.TRC_CC_REQ_TIMEOUT:
                     trc_req = TRCRequest.from_values(isd, ver, cache_only=True)
-                    meta = meta or self._get_cs()
                     req_id = mk_ctrl_req_id()
                     logging.info("Re-Requesting TRC from %s: %s [id: %016x]",
                                  meta, trc_req.short_desc(), req_id)
-                    self.send_meta(CtrlPayload(CertMgmt(trc_req), req_id=req_id), meta)
-                    self.requested_trcs[(isd, ver)] = (time.time(), meta)
-                    if self._labels:
-                        PENDING_TRC_REQS_TOTAL.labels(**self._labels).set(len(self.requested_trcs))
+                    self._send_trc_req(isd, ver, trc_req, req_id, meta)
+
+    def _send_trc_req(self, isd, ver, trc_req, req_id, meta):
+        with self.req_trcs_lock:
+            # Add time and meta to `requested_trcs`
+            # this replaces the meta with itself if called from `_check_trc_reqs`
+            self.requested_trcs[(isd, ver)] = (time.time(), meta)
+            if self._labels:
+                PENDING_TRC_REQS_TOTAL.labels(**self._labels).set(len(self.requested_trcs))
+        meta = meta or self._get_cs()
+        if not meta:
+            logging.error("Couldn't find a CS to request %sv%s TRC" % (isd, ver))
+            return
+        logging.debug("Requesting TRC [id: %016x] from %s" % (req_id, meta))
+        self.send_meta(CtrlPayload(CertMgmt(trc_req), req_id=req_id), meta)
 
     def _check_cert_reqs(self):
         """
@@ -357,15 +334,55 @@ class SCIONElement(object):
             for (isd_as, ver), (req_time, meta) in self.requested_certs.items():
                 if now - req_time >= self.TRC_CC_REQ_TIMEOUT:
                     cert_req = CertChainRequest.from_values(isd_as, ver, cache_only=True)
-                    meta = meta or self._get_cs()
                     req_id = mk_ctrl_req_id()
-                    logging.info("Re-Requesting CERTCHAIN from %s: %s [id: %016x]",
-                                 meta, cert_req.short_desc(), req_id)
-                    self.send_meta(CtrlPayload(CertMgmt(cert_req), req_id=req_id), meta)
-                    self.requested_certs[(isd_as, ver)] = (time.time(), meta)
-                    if self._labels:
-                        PENDING_CERT_REQS_TOTAL.labels(**self._labels).set(
-                            len(self.requested_certs))
+                    logging.info("Re-Requesting CERTCHAIN %s [id: %016x]",
+                                 cert_req.short_desc(), req_id)
+                    self._send_cert_req(isd_as, ver, cert_req, req_id, meta)
+
+    def _send_cert_req(self, isd_as, ver, cert_req, req_id, meta):
+        with self.req_certs_lock:
+            # Add time and meta to `requested_certs`
+            # this replaces the meta with itself if called from `_check_cert_reqs`
+            self.requested_certs[(isd_as, ver)] = (time.time(), meta)
+            if self._labels:
+                PENDING_CERT_REQS_TOTAL.labels(**self._labels).set(len(self.requested_certs))
+        meta = meta or self._get_cs()
+        if not meta:
+            logging.error("Couldn't find a CS to request %sv%s CERTCHAIN" % (isd_as, ver))
+            return
+        logging.debug("Requesting CERTCHAIN [id: %016x] from %s" % (req_id, meta))
+        self.send_meta(CtrlPayload(CertMgmt(cert_req), req_id=req_id), meta)
+
+    def _check_cert_req_states(self):
+        """
+        Check all CertRequestStates, add them to requested_certs and requested_trcs if needed
+        Remove the CertRequestState when the certificate is present
+        """
+        with self.cert_reqs_lock:
+            for (isd_as, ver) in list(self.cert_reqs):
+                cert_reqs = self.cert_reqs[(isd_as, ver)]
+                src = cert_reqs[0].src
+                cert = self.trust_store.get_cert(isd_as, src.chain_ver)
+                if cert:
+                    logging.info("Certificate for %sv%s was fetched, unblock thread." %
+                                 (src.ia, src.chain_ver))
+                    # Release waiting threads
+                    for cert_req in cert_reqs:
+                        cert_req.e.set()
+                    self.cert_reqs.pop((isd_as, ver))
+                    continue
+
+                # Try to find a valid meta, otherwise the CS is asked
+                meta = None
+                for cert_req in reversed(cert_reqs):
+                    if cert_req.meta:
+                        meta = cert_req.meta
+                        break
+                # Finally register the necessary requests
+                if not self.trust_store.get_trc(isd_as[0], src.trc_ver):
+                    # TRC must also be fetched
+                    self._request_trc(src.ia[0], src.trc_ver, meta)
+                self._request_cert(isd_as, src.chain_ver, meta)
 
     def _process_path_seg(self, seg_meta, req_id=None):
         """
@@ -389,8 +406,10 @@ class SCIONElement(object):
         missing_trcs = self._missing_trc_versions(seg_meta.trc_vers)
         missing_certs = self._missing_cert_versions(seg_meta.cert_vers)
         # Update missing TRCs/certs map
-        seg_meta.missing_trcs.update(missing_trcs)
-        seg_meta.missing_certs.update(missing_certs)
+        with seg_meta.miss_trc_lock:
+            seg_meta.missing_trcs.update(missing_trcs)
+        with seg_meta.miss_cert_lock:
+            seg_meta.missing_certs.update(missing_certs)
         # If all necessary TRCs/certs available, try to verify
         if seg_meta.verifiable():
             self._try_to_verify_seg(seg_meta)
@@ -409,7 +428,7 @@ class SCIONElement(object):
         try:
             self._verify_path_seg(seg_meta)
         except SCIONVerificationError as e:
-            logging.error("Signature verification failed for %s: %s" %
+            logging.error("Signature verification of segment failed for %s: %s" %
                           (seg_meta.seg.short_id(), e))
             return
         with self.unv_segs_lock:
@@ -425,7 +444,7 @@ class SCIONElement(object):
         Lookup certificate servers address and return meta.
         """
         try:
-            addr, port = self.dns_query_topo(CERTIFICATE_SERVICE)[0]
+            addr, port = self.dns_query_topo(ServiceType.CS)[0]
         except SCIONServiceLookupError as e:
             logging.warning("Lookup for certificate service failed: %s", e)
             return None
@@ -444,33 +463,23 @@ class SCIONElement(object):
         if not missing_trcs:
             return
         for isd, ver in missing_trcs:
-            with self.req_trcs_lock:
-                req_time, meta = self.requested_trcs.get((isd, ver), (None, None))
+            self._request_trc(isd, ver, seg_meta.meta)
+
+    def _request_trc(self, isd, ver, meta):
+        with self.req_trcs_lock:
+            req_time, _ = self.requested_trcs.get((isd, ver), (None, None))
+            if req_time:
+                logging.debug("Request for %sv%s TRC already registered" % (isd, ver))
                 if meta:
                     # There is already an outstanding request for the missing TRC
-                    # from somewhere else than than the local CS
-                    if seg_meta.meta:
-                        # Update the stored meta with the latest known server that has the TRC.
-                        self.requested_trcs[(isd, ver)] = (req_time, seg_meta.meta)
-                    continue
-                if req_time and not seg_meta.meta:
-                    # There is already an outstanding request for the missing TRC
-                    # to the local CS and we don't have a new meta.
-                    continue
-            trc_req = TRCRequest.from_values(isd, ver, cache_only=True)
-            meta = seg_meta.meta or self._get_cs()
-            if not meta:
-                logging.error("Couldn't find a CS to request TRC for PCB %s",
-                              seg_meta.seg.short_id())
-                continue
-            req_id = mk_ctrl_req_id()
-            logging.info("Requesting %sv%s TRC from %s, for PCB %s [id: %016x]",
-                         isd, ver, meta, seg_meta.seg.short_id(), req_id)
-            with self.req_trcs_lock:
-                self.requested_trcs[(isd, ver)] = (time.time(), seg_meta.meta)
-                if self._labels:
-                    PENDING_TRC_REQS_TOTAL.labels(**self._labels).set(len(self.requested_trcs))
-            self.send_meta(CtrlPayload(CertMgmt(trc_req), req_id=req_id), meta)
+                    # Update the stored meta with the latest known server that has the TRC.
+                    self.requested_trcs[(isd, ver)] = (req_time, meta)
+                    logging.debug("Updated %sv%s TRC meta %s" % (isd, ver, meta))
+                return
+        trc_req = TRCRequest.from_values(isd, ver)
+        req_id = mk_ctrl_req_id()
+        logging.info("Requesting %sv%s TRC [id: %016x]" % (isd, ver, req_id))
+        self._send_trc_req(isd, ver, trc_req, req_id, meta)
 
     def _request_missing_certs(self, seg_meta):
         """
@@ -485,33 +494,23 @@ class SCIONElement(object):
         if not missing_certs:
             return
         for isd_as, ver in missing_certs:
-            with self.req_certs_lock:
-                req_time, meta = self.requested_certs.get((isd_as, ver), (None, None))
+            self._request_cert(isd_as, ver, seg_meta.meta)
+
+    def _request_cert(self, isd_as, ver, meta):
+        with self.req_certs_lock:
+            req_time, _ = self.requested_certs.get((isd_as, ver), (None, None))
+            if req_time:
+                logging.debug("Request for %sv%s CERTCHAIN already registered" % (isd_as, ver))
                 if meta:
                     # There is already an outstanding request for the missing cert
-                    # from somewhere else than than the local CS
-                    if seg_meta.meta:
-                        # Update the stored meta with the latest known server that has the cert.
-                        self.requested_certs[(isd_as, ver)] = (req_time, seg_meta.meta)
-                    continue
-                if req_time and not seg_meta.meta:
-                    # There is already an outstanding request for the missing cert
-                    # to the local CS and we don't have a new meta.
-                    continue
-            cert_req = CertChainRequest.from_values(isd_as, ver, cache_only=True)
-            meta = seg_meta.meta or self._get_cs()
-            if not meta:
-                logging.error("Couldn't find a CS to request CERTCHAIN for PCB %s",
-                              seg_meta.seg.short_id())
-                continue
-            req_id = mk_ctrl_req_id()
-            logging.info("Requesting %sv%s CERTCHAIN from %s for PCB %s [id: %016x]",
-                         isd_as, ver, meta, seg_meta.seg.short_id(), req_id)
-            with self.req_certs_lock:
-                self.requested_certs[(isd_as, ver)] = (time.time(), seg_meta.meta)
-                if self._labels:
-                    PENDING_CERT_REQS_TOTAL.labels(**self._labels).set(len(self.requested_certs))
-            self.send_meta(CtrlPayload(CertMgmt(cert_req), req_id=req_id), meta)
+                    # Update the stored meta with the latest known server that has the cert.
+                    self.requested_certs[(isd_as, ver)] = (req_time, meta)
+                    logging.debug("Updated %sv%s CERTCHAIN meta %s" % (isd_as, ver, meta))
+                return
+        cert_req = CertChainRequest.from_values(isd_as, ver)
+        req_id = mk_ctrl_req_id()
+        logging.info("Requesting %sv%s CERTCHAIN [id: %016x]" % (isd_as, ver, req_id))
+        self._send_cert_req(isd_as, ver, cert_req, req_id, meta)
 
     def _missing_trc_versions(self, trc_versions):
         """
@@ -582,6 +581,7 @@ class SCIONElement(object):
             cs_meta.close()
         # Remove received TRC from map
         self._check_segs_with_rec_trc(isd, ver)
+        self._verify_certs()
 
     def _check_segs_with_rec_trc(self, isd, ver):
         """
@@ -623,7 +623,8 @@ class SCIONElement(object):
         isd_as, ver = rep.chain.get_leaf_isd_as_ver()
         logging.info("Cert chain reply received for %sv%s from %s [id: %s]",
                      isd_as, ver, meta, cpld.req_id_str())
-        self.trust_store.add_cert(rep.chain, True)
+        if not self._verify_cert(rep.chain):
+            return
         with self.req_certs_lock:
             self.requested_certs.pop((isd_as, ver), None)
             if self._labels:
@@ -633,8 +634,41 @@ class SCIONElement(object):
             cs_meta = self._get_cs()
             self.send_meta(CtrlPayload(CertMgmt(rep)), cs_meta)
             cs_meta.close()
+
+    def _verify_cert(self, cert):
+        """
+        Return if verification was successful
+        """
+        # Received cert chain
+        isd_as, ver = cert.get_leaf_isd_as_ver()
+        trc_ver = cert.core_as_cert.trc_version
+        trc = self.trust_store.get_trc(isd_as[0], trc_ver)
+        if not trc:
+            # Request TRC just to make sure
+            self._request_trc(isd_as[0], trc_ver, None)
+            with self.unv_certs_lock:
+                self.unv_certs[(isd_as, ver)] = cert
+            logging.error("Certificate chain verification for %s failed because of missing TRC" %
+                          cert)
+            return False
+        try:
+            verify_chain_trc(isd_as, cert, trc)
+        except SCIONVerificationError as e:
+            logging.error("Certificate chain verification failed for %s, %s: %s" %
+                          (cert, trc, e))
+            return False
+        self.trust_store.add_cert(cert, True)
+        with self.unv_certs_lock:
+            self.unv_certs.pop((isd_as, ver), None)
         # Remove received cert chain from map
         self._check_segs_with_rec_cert(isd_as, ver)
+        return True
+
+    def _verify_certs(self):
+        # Got a TRC, thus check all unverified certificates
+        unv_certs = self.unv_certs.copy()
+        for _, cert in unv_certs.items():
+            self._verify_cert(cert)
 
     def _check_segs_with_rec_cert(self, isd_as, ver):
         """
@@ -678,7 +712,13 @@ class SCIONElement(object):
         for i, asm in enumerate(seg.iter_asms()):
             cert_ia = asm.isd_as()
             trc = self.trust_store.get_trc(cert_ia[0], asm.p.trcVer)
+            if not trc:
+                logging.error("Could not get TRC %sv%s" % (cert_ia[0], asm.p.trcVer))
+                continue
             chain = self.trust_store.get_cert(asm.isd_as(), asm.p.certVer)
+            if not chain:
+                logging.error("Could not get cert chain %sv%s" % (asm.isd_as(), asm.p.certVer))
+                continue
             self._verify_exp_time(exp_time, chain)
             verify_chain_trc(cert_ia, chain, trc)
             seg.verify(chain.as_cert.subject_sig_key_raw, i)
@@ -706,6 +746,17 @@ class SCIONElement(object):
         except KeyError:
             logging.error("%s control payload type not supported: %s\n%s", pclass, ptype, msg)
         return None
+
+    def _get_fast_ctrl_handler(self, msg):
+        """
+        Return optional fast path handler.
+        """
+        pclass = msg.type()
+        type_map = self.CTRL_PLD_CLASS_FAST_MAP.get(pclass)
+        if not type_map:
+            return None
+        ptype = msg.inner_type()
+        return type_map.get(ptype)
 
     def _get_scmp_handler(self, pkt):
         scmp = pkt.l4_hdr
@@ -880,10 +931,7 @@ class SCIONElement(object):
         return self._udp_sock.send(packet.pack(), (dst, dst_port))
 
     def send_meta(self, msg, meta, next_hop_port=None):
-        if isinstance(meta, TCPMetadata):
-            assert not next_hop_port, next_hop_port
-            return self._send_meta_tcp(msg, meta)
-        elif isinstance(meta, SockOnlyMetadata):
+        if isinstance(meta, SockOnlyMetadata):
             assert not next_hop_port, next_hop_port
             return meta.sock.send(msg)
         elif isinstance(meta, UDPMetadata):
@@ -901,52 +949,11 @@ class SCIONElement(object):
             return False
         return self.send(pkt, *next_hop_port)
 
-    def _send_meta_tcp(self, msg, meta):
-        if not meta.sock:
-            tcp_sock = self._tcp_sock_from_meta(meta)
-            meta.sock = tcp_sock
-            self._tcp_conns_put(tcp_sock)
-        return meta.sock.send_msg(msg.pack())
-
-    def _tcp_sock_from_meta(self, meta):
-        assert meta.host
-        dst = meta.get_addr()
-        first_ip, first_port = self._get_first_hop(meta.path, dst)
-        active = True
-        try:
-            # Create low-level TCP socket and connect
-            sock = SCIONTCPSocket()
-            sock.bind((self.addr, 0))
-            sock.connect(dst, meta.port, meta.path, first_ip, first_port,
-                         flags=meta.flags)
-        except SCIONTCPError:
-            log_exception("TCP: connection init error, marking socket inactive")
-            sock = None
-            active = False
-        # Create and return TCPSocketWrapper
-        return TCPSocketWrapper(sock, dst, meta.path, active)
-
-    def _tcp_conns_put(self, sock):
-        dropped = 0
-        while True:
-            try:
-                self._tcp_new_conns.put(sock, block=False)
-            except queue.Full:
-                old_sock = self._tcp_new_conns.get_nowait()
-                old_sock.close()
-                logging.error("TCP: _tcp_new_conns is full. Closing old socket")
-                dropped += 1
-            else:
-                break
-        if dropped > 0:
-            logging.warning("%d TCP connection(s) dropped" % dropped)
-
     def run(self):
         """
         Main routine to receive packets and pass them to
         :func:`handle_request()`.
         """
-        self._tcp_start()
         threading.Thread(
             target=thread_safety_net, args=(self.packet_recv,),
             name="Elem.packet_recv", daemon=True).start()
@@ -1039,9 +1046,13 @@ class SCIONElement(object):
 
     def handle_recv(self, sock):
         """
-        Callback to handle a ready recving socket
+        Callback to handle a ready receiving socket
         """
-        packet, addr = sock.recv()
+        try:
+            packet, addr = sock.recv()
+        except SCIONIOError as e:
+            logging.error("Socket IO error: %s", e)
+            return
         if packet is None:
             self._socks.remove(sock)
             sock.close()
@@ -1050,7 +1061,21 @@ class SCIONElement(object):
                 if self._labels:
                     CONNECTED_TO_DISPATCHER.labels(**self._labels).set(0)
             return
-        self.packet_put(packet, addr, sock)
+
+        msg, meta = self._get_msg_meta(packet, addr, sock)
+        if msg is None:
+            return
+
+        # Try to handle immediately if supported for this message type:
+        handled = False
+        if isinstance(meta, UDPMetadata):
+            fast_handler = self._get_fast_ctrl_handler(msg)
+            if fast_handler:
+                handled = fast_handler(msg, meta)
+
+        # If no fast-path handler for this message OR handler explicitly skipped, enqueue:
+        if not handled:
+            self._in_buf_put((msg, meta))
 
     def packet_recv(self):
         """
@@ -1061,7 +1086,6 @@ class SCIONElement(object):
                 self._setup_sockets(False)
             for sock, callback in self._socks.select_(timeout=0.1):
                 callback(sock)
-            self._tcp_socks_update()
         self._socks.close()
         self.stopped_flag.set()
 
@@ -1079,79 +1103,12 @@ class SCIONElement(object):
             except queue.Empty:
                 continue
 
-    def _tcp_start(self):
-        if not self.USE_TCP:
-            return
-        if not self._tcp_sock:
-            logging.warning("TCP: accept socket is unset, port:%d", self._port)
-            return
-        threading.Thread(
-            target=thread_safety_net, args=(self._tcp_accept_loop,),
-            name="Elem._tcp_accept_loop", daemon=True).start()
-
-    def _tcp_accept_loop(self):
-        while self.run_flag.is_set():
-            try:
-                logging.debug("TCP: waiting for connections")
-                self._tcp_conns_put(TCPSocketWrapper(*self._tcp_sock.accept()))
-                logging.debug("TCP: accepted connection")
-            except SCIONTCPTimeout:
-                pass
-            except SCIONTCPError:
-                log_exception("TCP: error on accept()")
-                logging.error("TCP: leaving the accept loop")
-                break
-        try:
-            self._tcp_sock.close()
-        except SCIONTCPError:
-            log_exception("TCP: error on closing _tcp_sock")
-
-    def _tcp_socks_update(self):
-        if not self.USE_TCP:
-            return
-        self._socks.remove_inactive()
-        self._tcp_add_waiting()
-
-    def _tcp_add_waiting(self):
-        while True:
-            try:
-                self._socks.add(self._tcp_new_conns.get_nowait(),
-                                self._tcp_handle_recv)
-            except queue.Empty:
-                break
-
-    def _tcp_handle_recv(self, sock):
-        """
-        Callback to handle a ready recving socket
-        """
-        msg, meta = sock.get_msg_meta()
-        logging.debug("tcp_handle_recv:%s, %s", msg, meta)
-        if msg is None and meta is None:
-            self._socks.remove(sock)
-            sock.close()
-            return
-        if msg:
-            self._in_buf_put((msg, meta))
-
-    def _tcp_clean(self):
-        if not hasattr(self, "_tcp_sock") or not self._tcp_sock:
-            return
-        # Close all TCP sockets.
-        while not self._tcp_new_conns.empty():
-            try:
-                tcp_sock = self._tcp_new_conns.get_nowait()
-            except queue.Empty:
-                break
-            tcp_sock.close()
-
     def stop(self):
         """Shut down the daemon thread."""
         # Signal that the thread should stop
         self.run_flag.clear()
         # Wait for the thread to finish
         self.stopped_flag.wait(5)
-        # Close tcp sockets.
-        self._tcp_clean()
 
     def _quiet_startup(self):
         return (time.time() - self._startup) < self.STARTUP_QUIET_PERIOD
@@ -1163,17 +1120,16 @@ class SCIONElement(object):
 
         :param str qname: Service to query for.
         """
-        assert qname in SERVICE_TYPES
         service_map = {
-            BEACON_SERVICE: self.topology.beacon_servers,
-            CERTIFICATE_SERVICE: self.topology.certificate_servers,
-            PATH_SERVICE: self.topology.path_servers,
-            SIBRA_SERVICE: self.topology.sibra_servers,
+            ServiceType.BS: self.topology.beacon_servers,
+            ServiceType.CS: self.topology.certificate_servers,
+            ServiceType.PS: self.topology.path_servers,
+            ServiceType.SIBRA: self.topology.sibra_servers,
         }
         # Generate fallback from local topology
         results = []
         for srv in service_map[qname]:
-            addr, port = srv.public[0]
+            addr, port = srv.public
             results.append((addr, port))
         # FIXME(kormat): replace with new discovery service when that's ready.
         if not results:
@@ -1210,10 +1166,6 @@ class SCIONElement(object):
         if not one_hop:
             return self._DefaultMeta.from_values(ia, host, path, port=port,
                                                  reuse=reuse)
-        # One hop path extension in handled in a different way in TCP and UDP
-        if self._DefaultMeta == TCPMetadata:
-            return TCPMetadata.from_values(ia, host, path, port=port, reuse=reuse,
-                                           flags=TCPFlags.ONEHOPPATH)
         return UDPMetadata.from_values(ia, host, path, port=port, reuse=reuse,
                                        ext_hdrs=[OneHopPathExt()])
 
@@ -1240,8 +1192,8 @@ class SCIONElement(object):
         PENDING_CERT_REQS_TOTAL.labels(**self._labels).set(0)
         CONNECTED_TO_DISPATCHER.labels(**self._labels).set(0)
 
-    def _get_path_via_sciond(self, isd_as, flush=False):
-        flags = lib_sciond.PathRequestFlags(flush=flush)
+    def _get_path_via_sciond(self, isd_as, refresh=False):
+        flags = lib_sciond.PathRequestFlags(refresh=refresh)
         start = time.time()
         while time.time() - start < API_TOUT:
             try:
@@ -1254,21 +1206,69 @@ class SCIONElement(object):
         logging.warning("Unable to get path to %s from SCIOND.", isd_as)
         return None
 
-    def check_revocation(self, srev_info):
+    def check_revocation(self, srev_info, callback, meta=None):
         """
-        Checks if the revocation is valid and processing should continue
+        Checks if the revocation is valid and a certificate is present,
+        otherwise start a new thread that waits for the certificate to be fetched
         """
         rev_info = srev_info.rev_info()
-        rev_info.validate()
-        if not rev_info.active():
-            raise RevInfoExpiredError("RevocationInfo has expired: %s" % rev_info.short_desc())
-        # FIXME(worxli): different cert versions should be handled (#1545)
-        cert = self.trust_store.get_cert(rev_info.isd_as())
-        if not cert:
-            raise SignedRevInfoCertFetchError(
-                "Failed to fetch cert for SRevInfo: %s" % srev_info.short_desc())
-        srev_info.verify(cert.as_cert.subject_sig_key_raw)
-        logging.debug("Successfully validated and verified RevInfo %s" % rev_info)
+        try:
+            rev_info.validate()
+            if not rev_info.active():
+                raise RevInfoExpiredError("RevocationInfo has expired: %s" % rev_info.short_desc())
+        except SCIONBaseError as e:
+            logging.error("Revocation validation failed for %s from %s:\n%s",
+                          srev_info.short_desc(), meta, e)
+            callback(e)
+            return
+        # Revocation is valid and still active, try to verify it
+        src = DefaultSignSrc(srev_info.psign.p.src)
+        if not self.trust_store.get_cert(src.ia):
+            logging.info("Start new thread for certificate (%sv%s) fetching!" %
+                         (src.ia, src.chain_ver))
+            threading.Thread(
+                target=thread_safety_net, args=(self.wait_for_rev_cert, src, srev_info, meta,
+                                                callback), daemon=True).start()
+        else:
+            self.verify_revocation(src, srev_info, meta, callback)
+
+    def wait_for_rev_cert(self, src, srev_info, meta, callback):
+        """
+        Should run in a thread!
+        Registers a certificate request and waits for an event to continue processing.
+        """
+        cert_req = self.register_cert_req(src, meta)
+        # Wait until revocation has expired
+        rev_info = srev_info.rev_info()
+        val_window = rev_info.p.timestamp + rev_info.p.ttl - int(time.time()) + REVOCATION_GRACE
+        done = cert_req.e.wait(val_window)
+        if not done:
+            logging.info("Certificate fetching for %sv%s failed with a timeout." %
+                         (src.ia, src.chain_ver))
+            callback(
+                SCIONBaseError("Fetching the certificate for %s resulted in a timeout." % src.ia)
+            )
+            return
+        # certificate has been successfully fetched
+        self.verify_revocation(src, srev_info, meta, callback)
+
+    def verify_revocation(self, src, srev_info, meta, callback):
+        """
+        Certificate should be available when method is invoked
+        Try to verify the revocation and invoke the callback
+        """
+        cert = self.trust_store.get_cert(src.ia)
+        try:
+            srev_info.verify(cert.as_cert.subject_sig_key_raw)
+        except SCIONBaseError as e:
+            logging.error("Revocation verification failed for %s:\n%s from %s",
+                          srev_info.short_desc(), e, meta)
+            # return the error to the callback (SCIOND wants it)
+            callback(e)
+
+        logging.debug("Successfully validated and verified %s" % srev_info.short_desc())
+        # Return a None error to the callback
+        callback(None)
 
     def check_revoked_interface(self, seg, revocations):
         """
@@ -1289,3 +1289,17 @@ class SCIONElement(object):
                                   (rev_info.p.ifID, rev_info.isd_as(), seg.short_desc()))
                     return False
         return True
+
+    def register_cert_req(self, src, meta):
+        """
+        Register a CertRequestState object for a certificate (isd_as, ver) pair
+        """
+        if isinstance(meta, SockOnlyMetadata) or isinstance(meta, SCMPMetadata) or (meta and
+           meta.get_addr().isd_as == self.addr.isd_as):
+            meta = None
+        cert_req = CertRequestState(src, meta)
+        with self.cert_reqs_lock:
+            self.cert_reqs[(src.ia, src.chain_ver)].append(cert_req)
+            logging.debug("Added CertRequestState for %sv%s from %s" % (src.ia,
+                          src.chain_ver, meta))
+        return cert_req

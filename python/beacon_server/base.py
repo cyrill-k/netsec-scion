@@ -1,4 +1,5 @@
 # Copyright 2014 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,22 +32,25 @@ from prometheus_client import Counter, Gauge
 from beacon_server.if_state import InterfaceState
 from lib.crypto.asymcrypto import get_sig_key
 from lib.crypto.symcrypto import kdf
+from lib.crypto.util import (
+    get_master_key,
+    MASTER_KEY_0,
+    MASTER_KEY_1
+)
 from lib.defines import (
-    BEACON_SERVICE,
     EXP_TIME_UNIT,
     GEN_CACHE_PATH,
     MIN_REVOCATION_TTL,
     PATH_POLICY_FILE,
-    PATH_SERVICE,
 )
 from lib.errors import (
-    SCIONBaseError,
     SCIONKeyError,
     SCIONParseError,
     SCIONPathPolicyViolated,
     SCIONServiceLookupError,
 )
 from lib.msg_meta import UDPMetadata
+from lib.packet.cert_mgmt import CertChainRequest, CertMgmt
 from lib.packet.ext.one_hop_path import OneHopPathExt
 from lib.path_seg_meta import PathSegMeta
 from lib.packet.ctrl_pld import CtrlPayload
@@ -77,6 +81,7 @@ from lib.types import (
     CertMgmtType,
     PathMgmtType as PMT,
     PayloadClass,
+    ServiceType,
 )
 from lib.util import (
     SCIONTime,
@@ -106,7 +111,7 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
     """
     The SCION PathConstructionBeacon Server.
     """
-    SERVICE_TYPE = BEACON_SERVICE
+    SERVICE_TYPE = ServiceType.BS
     # ZK path for incoming PCBs
     ZK_PCB_CACHE_PATH = "pcb_cache"
     # ZK path for revocations.
@@ -121,23 +126,29 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
     IF_TIMEOUT_INTERVAL = 1
     # Interval to send keep-alive msgs
     IFID_INTERVAL = 1
+    # Interval between two consecutive requests (in seconds).
+    CERT_REQ_RATE = 10
 
-    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH, prom_export=None):
+    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH,
+                 prom_export=None, sciond_path=None):
         """
         :param str server_id: server identifier.
         :param str conf_dir: configuration directory.
         :param str prom_export: prometheus export address.
+        :param str sciond_path: path to sciond socket.
         """
         super().__init__(server_id, conf_dir, spki_cache_dir=spki_cache_dir,
-                         prom_export=prom_export)
+                         prom_export=prom_export, sciond_path=sciond_path)
         self.config = self._load_as_conf()
+        self.master_key_0 = get_master_key(self.conf_dir, MASTER_KEY_0)
+        self.master_key_1 = get_master_key(self.conf_dir, MASTER_KEY_1)
         # TODO: add 2 policies
         self.path_policy = PathPolicy.from_file(
             os.path.join(conf_dir, PATH_POLICY_FILE))
         self.signing_key = get_sig_key(self.conf_dir)
-        self.of_gen_key = kdf(self.config.master_as_key, b"Derive OF Key")
+        self.of_gen_key = kdf(self.master_key_0, b"Derive OF Key")
         # Amount of time units a HOF is valid (time unit is EXP_TIME_UNIT).
-        self.default_hof_exp_time = int(self.config.segment_ttl / EXP_TIME_UNIT)
+        self.default_hof_exp_time = int(self.config.segment_ttl / EXP_TIME_UNIT) - 1
         self.ifid_state = {}
         for ifid in self.ifid2br:
             self.ifid_state[ifid] = InterfaceState()
@@ -157,6 +168,9 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
                 PMT.REVOCATION: self._handle_revocation,
             },
         }
+        self.CTRL_PLD_CLASS_FAST_MAP = {
+            PayloadClass.IFID: {PayloadClass.IFID: self.try_fast_handle_ifid_packet},
+        }
         self.SCMP_PLD_CLASS_MAP = {
             SCMPClass.PATH: {
                 SCMPPathClass.REVOKED_IF: self._handle_scmp_revocation,
@@ -165,7 +179,7 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
 
         zkid = ZkID.from_values(self.addr.isd_as, self.id,
                                 [(self.addr.host, self._port)]).pack()
-        self.zk = Zookeeper(self.addr.isd_as, BEACON_SERVICE, zkid,
+        self.zk = Zookeeper(self.addr.isd_as, self.SERVICE_TYPE, zkid,
                             self.topology.zookeepers)
         self.zk.retry("Joining party", self.zk.party_setup)
         self.pcb_cache = ZkSharedCache(
@@ -227,7 +241,7 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         :rtype: int
         """
         cert_exp = self._get_my_cert().as_cert.expiration_time
-        max_exp_time = int((cert_exp-ts) / EXP_TIME_UNIT)
+        max_exp_time = int((cert_exp-ts) / EXP_TIME_UNIT) - 1
         return min(max_exp_time, self.default_hof_exp_time)
 
     def _mk_if_info(self, if_id):
@@ -376,7 +390,7 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         if out_info["remote_ia"].int() and not out_info["remote_if"]:
             return None
         exp_time = self.hof_exp_time(ts)
-        if exp_time <= 0:
+        if exp_time < 0:
             logging.error("Invalid hop field expiration time value: %s", exp_time)
             return None
         hof = HopOpaqueField.from_values(exp_time, in_if, out_if, xover=xover)
@@ -401,6 +415,35 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         pcb.add_asm(asm, ProtoSignType.ED25519, self.addr.isd_as.pack())
         return pcb
 
+    def try_fast_handle_ifid_packet(self, cpld, meta):
+        """
+        Update the last_updated timestamp for the corresponding interface.
+        If the interface is not currently active (i.e. it will be activated by
+        this IFID packet), the packet will NOT be handled (returns False).
+
+        Note: updating the timestamp is very cheap (same order of magnitude as
+        enqueuing the packet for asynchronous processing), so it can safely be
+        done on the packet-receive thread.
+        This helps to process IFID packets for active interfaces in time, as it
+        and avoids the problem that interfaces time out because the IFIDs are
+        stuck in a long packet processing queue (behind PCBs).
+        For inactive interfaces, the processing of the IFIDs is more work as
+        state updates will be sent out. Also, this is not time-critical as the
+        interface is, well, down.
+
+        :returns: has the packet been handled
+        """
+        pld = cpld.union
+        assert isinstance(pld, IFIDPayload), type(pld)
+        ifid = meta.pkt.path.get_hof().ingress_if
+        # Note: No self.ifid_state_lock; the lock is to guard against concurrent
+        # changes of the state of interfaces and this won't change the state.
+        # Also, no entries are added to or removed from ifid_state after
+        # startup.
+        if ifid not in self.ifid_state:
+            raise SCIONKeyError("Invalid IF %d in IFIDPayload" % ifid)
+        return self.ifid_state[ifid].update_active()
+
     def handle_ifid_packet(self, cpld, meta):
         """
         Update the interface state for the corresponding interface.
@@ -410,7 +453,7 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         """
         pld = cpld.union
         assert isinstance(pld, IFIDPayload), type(pld)
-        ifid = pld.p.relayIF
+        ifid = meta.pkt.path.get_hof().ingress_if
         with self.ifid_state_lock:
             if ifid not in self.ifid_state:
                 raise SCIONKeyError("Invalid IF %d in IFIDPayload" % ifid)
@@ -427,7 +470,7 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
                     # Inform BRs about the interface coming up.
                     metas = []
                     for br in self.topology.border_routers:
-                        br_addr, br_port = br.int_addrs[0].public[0]
+                        br_addr, br_port = br.ctrl_addrs.public
                         metas.append(UDPMetadata.from_values(host=br_addr, port=br_port))
                     info = IFStateInfo.from_values(ifid, True)
                     self._send_ifstate_update([info], metas)
@@ -449,6 +492,9 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         threading.Thread(
             target=thread_safety_net, args=(self._check_trc_cert_reqs,),
             name="Elem.check_trc_cert_reqs", daemon=True).start()
+        threading.Thread(
+            target=thread_safety_net, args=(self._check_local_cert,),
+            name="BS._check_local_cert", daemon=True).start()
         super().run()
 
     def worker(self):
@@ -534,13 +580,8 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
                     logging.error(
                         "Error parsing revocation info from ZK: %s", e)
                     continue
-                try:
-                    self.check_revocation(srev_info)
-                except SCIONBaseError as e:
-                    logging.error("Revocation check from zookeeper for %s failed:\n%s",
-                                  srev_info.short_desc(), e)
-                    continue
-                self.local_rev_cache.add(srev_info)
+                self.check_revocation(srev_info, lambda x: lambda:
+                                      self.local_rev_cache.add(srev_info) if not x else False)
 
     def _issue_revocations(self, revoked_ifs):
         """
@@ -572,22 +613,21 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
             self.if_revocations[if_id] = srev_info
             self._process_revocation(srev_info)
             infos.append(IFStateInfo.from_values(if_id, False, srev_info))
-        border_metas = []
+        metas = []
         # Add all BRs.
         for br in self.topology.border_routers:
-            br_addr, br_port = br.int_addrs[0].public[0]
-            border_metas.append(UDPMetadata.from_values(host=br_addr, port=br_port))
+            br_addr, br_port = br.ctrl_addrs.public
+            metas.append(UDPMetadata.from_values(host=br_addr, port=br_port))
         # Add local path server.
-        ps_meta = []
         if self.topology.path_servers:
             try:
-                addr, port = self.dns_query_topo(PATH_SERVICE)[0]
+                addr, port = self.dns_query_topo(ServiceType.PS)[0]
             except SCIONServiceLookupError:
                 addr, port = None, None
             # Create a meta if there is a local path service
             if addr:
-                ps_meta.append(UDPMetadata.from_values(host=addr, port=port))
-        self._send_ifstate_update(infos, border_metas, ps_meta)
+                metas.append(UDPMetadata.from_values(host=addr, port=port))
+        self._send_ifstate_update(infos, metas)
 
     def _handle_scmp_revocation(self, pld, meta):
         srev_info = SignedRevInfo.from_raw(pld.info.srev_info)
@@ -599,13 +639,8 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
         rev_info = srev_info.rev_info()
         assert isinstance(rev_info, RevocationInfo), type(rev_info)
         logging.debug("Received revocation from %s: %s", meta, rev_info.short_desc())
-        try:
-            self.check_revocation(srev_info)
-        except SCIONBaseError as e:
-            logging.error("Revocation check failed for %s from %s:\n%s",
-                          srev_info.short_desc(), meta, e)
-            return
-        self._process_revocation(srev_info)
+        self.check_revocation(srev_info, lambda x:
+                              self._process_revocation(srev_info) if not x else False, meta)
 
     def handle_rev_objs(self):
         with self._rev_seg_lock:
@@ -744,12 +779,10 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
                 return
         self._send_ifstate_update(infos, [meta])
 
-    def _send_ifstate_update(self, state_infos, border_metas, server_metas=None):
-        server_metas = server_metas or []
+    def _send_ifstate_update(self, state_infos, server_metas):
         payload = CtrlPayload(PathMgmt(IFStatePayload.from_values(state_infos)))
-        for meta in border_metas:
-            self.send_meta(payload.copy(), meta, (meta.host, meta.port))
         for meta in server_metas:
+            logging.debug("IFState update to %s:%s", meta.host, meta.port)
             self.send_meta(payload.copy(), meta)
 
     def _send_ifid_updates(self):
@@ -764,10 +797,29 @@ class BeaconServer(SCIONElement, metaclass=ABCMeta):
 
             # send keep-alives on all known BR interfaces
             for ifid in self.ifid2br:
-                br_addr, br_port = self.get_border_addr(ifid)
-                meta = self._build_meta(host=br_addr, port=br_port)
+                br = self.ifid2br[ifid]
+                br_addr, br_port = br.int_addrs.public
+                one_hop_path = self._create_one_hop_path(ifid)
+                meta = self._build_meta(ia=br.interfaces[ifid].isd_as, host=SVCType.BS_M,
+                                        path=one_hop_path, one_hop=True)
                 self.send_meta(CtrlPayload(IFIDPayload.from_values(ifid)),
-                               meta, (meta.host, meta.port))
+                               meta, (br_addr, br_port))
+
+    def _check_local_cert(self):
+        while self.run_flag.is_set():
+            chain = self._get_my_cert()
+            exp = min(chain.as_cert.expiration_time, chain.core_as_cert.expiration_time)
+            diff = exp - int(time.time())
+            if diff > self.config.segment_ttl:
+                time.sleep(diff - self.config.segment_ttl)
+                continue
+            cs_meta = self._get_cs()
+            req = CertChainRequest.from_values(
+                self.addr.isd_as, chain.as_cert.version+1, cache_only=True)
+            logging.info("Request new certificate chain. Req: %s", req)
+            self.send_meta(CtrlPayload(CertMgmt(req)), cs_meta)
+            cs_meta.close()
+            time.sleep(self.CERT_REQ_RATE)
 
     def _init_metrics(self):
         super()._init_metrics()

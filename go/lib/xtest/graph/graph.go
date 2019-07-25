@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,11 +25,14 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/seg"
 	"github.com/scionproto/scion/go/lib/spath"
+	"github.com/scionproto/scion/go/lib/util"
+	"github.com/scionproto/scion/go/proto"
 )
 
 // Graph implements a graph of ASes and IFIDs for testing purposes. IFIDs
@@ -215,7 +218,8 @@ func (g *Graph) Beacon(ifids []common.IFIDType) *seg.PathSegment {
 
 	segment, err := seg.NewSeg(
 		&spath.InfoField{
-			ISD: uint16(g.parents[ifids[0]].I),
+			ISD:   uint16(g.parents[ifids[0]].I),
+			TsInt: util.TimeToSecs(time.Now()),
 		})
 	if err != nil {
 		panic(err)
@@ -242,7 +246,12 @@ func (g *Graph) Beacon(ifids []common.IFIDType) *seg.PathSegment {
 		}
 
 		b := make(common.RawBytes, spath.HopFieldLength)
-		spath.NewHopField(b, inIF, outIF)
+		hf := spath.HopField{
+			ConsIngress: inIF,
+			ConsEgress:  outIF,
+			ExpTime:     spath.DefaultHopFExpiry,
+		}
+		hf.Write(b)
 		localHopEntry := &seg.HopEntry{
 			RawInIA:     inIA.IAInt(),
 			RemoteInIF:  remoteInIF,
@@ -266,7 +275,12 @@ func (g *Graph) Beacon(ifids []common.IFIDType) *seg.PathSegment {
 			peeringLocalIF := common.IFIDType(intIFID)
 			if g.isPeer[peeringLocalIF] {
 				b := make(common.RawBytes, spath.HopFieldLength)
-				spath.NewHopField(b, peeringLocalIF, outIF)
+				hf := spath.HopField{
+					ConsIngress: peeringLocalIF,
+					ConsEgress:  outIF,
+					ExpTime:     spath.DefaultHopFExpiry,
+				}
+				hf.Write(b)
 				peeringRemoteIF := g.links[peeringLocalIF]
 				peeringIA := g.parents[peeringRemoteIF]
 				peerHopEntry := &seg.HopEntry{
@@ -281,7 +295,7 @@ func (g *Graph) Beacon(ifids []common.IFIDType) *seg.PathSegment {
 			}
 		}
 
-		segment.ASEntries = append(segment.ASEntries, asEntry)
+		segment.AddASEntry(asEntry, proto.SignType_none, common.RawBytes{})
 		remoteInIF = outIF
 		inIF = remoteOutIF
 		inIA = currIA
@@ -375,53 +389,6 @@ type EdgeDesc struct {
 	Yia   string
 	Yifid common.IFIDType
 	Peer  bool
-}
-
-// Graph description of the topology in doc/fig/default-topo.pdf.
-// Comments mention root name for IFIDs.
-var DefaultGraphDescription = &Description{
-	Nodes: []string{
-		"1-ff00:0:110", // 11
-		"1-ff00:0:111", // 14
-		"1-ff00:0:112", // 17
-		"1-ff00:0:120", // 12
-		"1-ff00:0:121", // 15
-		"1-ff00:0:122", // 18
-		"1-ff00:0:130", // 13
-		"1-ff00:0:131", // 16
-		"1-ff00:0:132", // 19
-		"1-ff00:0:133", // 10
-		"2-ff00:0:210", // 21
-		"2-ff00:0:211", // 23
-		"2-ff00:0:212", // 25
-		"2-ff00:0:220", // 22
-		"2-ff00:0:221", // 24
-		"2-ff00:0:222", // 26
-	},
-	Edges: []EdgeDesc{
-		{"1-ff00:0:110", 1112, "1-ff00:0:120", 1211, false},
-		{"1-ff00:0:110", 1113, "1-ff00:0:130", 1311, false},
-		{"1-ff00:0:110", 1121, "2-ff00:0:210", 2111, false},
-		{"1-ff00:0:110", 1114, "1-ff00:0:111", 1411, false},
-		{"1-ff00:0:120", 1213, "1-ff00:0:130", 1312, false},
-		{"1-ff00:0:120", 1222, "2-ff00:0:220", 2212, false},
-		{"1-ff00:0:120", 1215, "1-ff00:0:121", 1512, false},
-		{"1-ff00:0:130", 1316, "1-ff00:0:131", 1613, false},
-		{"1-ff00:0:111", 1415, "1-ff00:0:121", 1514, true},
-		{"1-ff00:0:111", 1423, "2-ff00:0:211", 2314, true},
-		{"1-ff00:0:111", 1417, "1-ff00:0:112", 1714, false},
-		{"1-ff00:0:121", 1516, "1-ff00:0:131", 1615, true},
-		{"1-ff00:0:121", 1518, "1-ff00:0:122", 1815, false},
-		{"1-ff00:0:131", 1619, "1-ff00:0:132", 1916, false},
-		{"1-ff00:0:132", 1910, "1-ff00:0:133", 1019, false},
-		{"2-ff00:0:210", 2122, "2-ff00:0:220", 2221, false},
-		{"2-ff00:0:210", 2123, "2-ff00:0:211", 2321, false},
-		{"2-ff00:0:220", 2224, "2-ff00:0:221", 2422, false},
-		{"2-ff00:0:211", 2324, "2-ff00:0:221", 2423, true},
-		{"2-ff00:0:211", 2325, "2-ff00:0:212", 2523, false},
-		{"2-ff00:0:211", 2326, "2-ff00:0:222", 2623, false},
-		{"2-ff00:0:221", 2426, "2-ff00:0:222", 2624, false},
-	},
 }
 
 func NewDefaultGraph() *Graph {

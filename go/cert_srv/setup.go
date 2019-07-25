@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,24 @@
 package main
 
 import (
-	"time"
+	"path/filepath"
 
-	"github.com/scionproto/scion/go/cert_srv/conf"
+	"github.com/BurntSushi/toml"
+
+	"github.com/scionproto/scion/go/cert_srv/internal/csconfig"
+	"github.com/scionproto/scion/go/cert_srv/internal/reiss"
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl"
+	"github.com/scionproto/scion/go/lib/env"
+	"github.com/scionproto/scion/go/lib/infra"
+	"github.com/scionproto/scion/go/lib/infra/infraenv"
+	"github.com/scionproto/scion/go/lib/infra/messenger"
+	"github.com/scionproto/scion/go/lib/infra/modules/itopo"
+	"github.com/scionproto/scion/go/lib/infra/modules/trust"
 	"github.com/scionproto/scion/go/lib/log"
 	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/go/proto"
 )
 
 const (
@@ -33,72 +43,127 @@ const (
 	ErrorSNET      = "Unable to create local SCION Network context"
 )
 
-// setup loads and sets the newest configuration. If needed, the snet/dispatcher are initialized.
+// setupBasic loads the config from file and initializes logging.
+func setupBasic() error {
+	// Load and initialize config.
+	if _, err := toml.DecodeFile(env.ConfigFile(), &config); err != nil {
+		return err
+	}
+	if err := env.InitLogging(&config.Logging); err != nil {
+		return err
+	}
+	return env.LogSvcStarted(common.CS, config.General.ID)
+}
+
+// setup initializes the config and sets the messenger.
 func setup() error {
-	oldConf := conf.Get()
-	newConf, err := loadConf(oldConf)
-	if err != nil {
-		return common.NewBasicError(ErrorConf, err)
+	if err := env.InitGeneral(&config.General); err != nil {
+		return common.NewBasicError("Unable to initialize General config", err)
 	}
-	// Set signer and verifier
-	if err = setDefaultSignerVerifier(newConf); err != nil {
-		return common.NewBasicError(ErrorSign, err)
+	itopo.SetCurrentTopology(config.General.Topology)
+	env.InitSciondClient(&config.Sciond)
+	if err := config.CS.Init(config.General.ConfigDir); err != nil {
+		return common.NewBasicError("Unable to initialize CS config", err)
 	}
-	// Close dispatcher if the addresses are changed
-	if oldConf != nil && (!oldConf.PublicAddr.EqAddr(newConf.PublicAddr) ||
-		!oldConf.BindAddr.EqAddr(newConf.BindAddr)) {
-		if err := disp.Close(); err != nil {
-			return common.NewBasicError(ErrorDispClose, err)
-		}
+	// Load CS state.
+	if err := initState(&config); err != nil {
+		return common.NewBasicError("Unable to initialize CS state", err)
 	}
-	// Set the new configuration.
-	conf.Set(newConf)
-	// Initialize snet with retries if not already initialized
-	if oldConf == nil {
-		if err = initSNET(newConf.PublicAddr.IA, initAttempts, initInterval); err != nil {
-			return common.NewBasicError(ErrorSNET, err)
-		}
-	}
-	// Create new dispatcher if it does not exist or is closed
-	if oldConf == nil || disp.closed {
-		if disp, err = NewDispatcher(newConf.PublicAddr, newConf.BindAddr); err != nil {
-			return common.NewBasicError(ErrorDispInit, err)
-		}
-		defer func() { go disp.Run() }()
+	if err := setMessenger(&config); err != nil {
+		return common.NewBasicError("Unable to set messenger", err)
 	}
 	return nil
 }
 
-// loadConf loads the newest configuration.
-func loadConf(oldConf *conf.Conf) (*conf.Conf, error) {
-	if oldConf != nil {
-		return conf.ReloadConf(oldConf)
+// initState sets the state.
+func initState(config *Config) error {
+	var err error
+	config.state, err = csconfig.LoadState(config.General.ConfigDir, config.General.Topology.Core)
+	if err != nil {
+		return common.NewBasicError("Unable to load CS state", err)
 	}
-	return conf.Load(*id, *confDir, *cacheDir, *stateDir)
+	if config.state.TrustDB, err = config.TrustDB.New(); err != nil {
+		return common.NewBasicError("Unable to initialize trustDB", err)
+	}
+	trustConf := &trust.Config{
+		MustHaveLocalChain: true,
+		ServiceType:        proto.ServiceType_cs,
+	}
+	config.state.Store, err = trust.NewStore(config.state.TrustDB,
+		config.General.Topology.ISD_AS, trustConf, log.Root())
+	if err != nil {
+		return common.NewBasicError("Unable to initialize trust store", err)
+	}
+	err = config.state.Store.LoadAuthoritativeTRC(filepath.Join(config.General.ConfigDir, "certs"))
+	if err != nil {
+		return common.NewBasicError("Unable to load local TRC", err)
+	}
+	err = config.state.Store.LoadAuthoritativeChain(
+		filepath.Join(config.General.ConfigDir, "certs"))
+	if err != nil {
+		return common.NewBasicError("Unable to load local Chain", err)
+	}
+	if err = setDefaultSignerVerifier(config.state, config.General.Topology.ISD_AS); err != nil {
+		return common.NewBasicError("Unable to set default signer and verifier", err)
+	}
+	return nil
 }
 
-// setDefaultSignerVerifier sets the signer and verifier. The newest certificate chain version is
-// used.
-func setDefaultSignerVerifier(c *conf.Conf) error {
-	sign, err := CreateSign(c.PublicAddr.IA, c.Store)
+// setDefaultSignerVerifier sets the signer and verifier. The newest certificate chain version
+// in the store is used.
+func setDefaultSignerVerifier(c *csconfig.State, pubIA addr.IA) error {
+	sign, err := trust.CreateSign(pubIA, c.Store)
 	if err != nil {
 		return err
 	}
 	c.SetSigner(ctrl.NewBasicSigner(sign, c.GetSigningKey()))
-	c.SetVerifier(&SigVerifier{&ctrl.BasicSigVerifier{}})
+	c.SetVerifier(ctrl.NewBasicSigVerifier(c.Store))
 	return nil
 }
 
-// initSNET initializes snet. The number of attempts is specified, as well as the sleep duration.
-// This is needed, since supervisord might take some time, until sciond is initialized.
-func initSNET(ia addr.IA, attempts int, sleep time.Duration) (err error) {
-	// Initialize SCION local networking module
-	for i := 0; i < attempts; i++ {
-		if err = snet.Init(ia, *sciondPath, *dispPath); err == nil {
-			break
-		}
-		log.Error("Unable to initialize snet", "Retry interval", sleep, "err", err)
-		time.Sleep(sleep)
+// setMessenger sets the messenger and the internal messenger of the store in
+// config.CS. This function may only be called once per config.
+func setMessenger(config *Config) error {
+	topoAddress := config.General.Topology.CS.GetById(config.General.ID)
+	if topoAddress == nil {
+		return common.NewBasicError("Unable to find topo address", nil)
 	}
-	return err
+	msgrI, err := infraenv.InitMessengerWithSciond(
+		config.General.Topology.ISD_AS,
+		env.GetPublicSnetAddress(config.General.Topology.ISD_AS, topoAddress),
+		env.GetBindSnetAddress(config.General.Topology.ISD_AS, topoAddress),
+		addr.SvcCS,
+		config.General.ReconnectToDispatcher,
+		config.state.Store,
+		config.Sciond,
+	)
+	if err != nil {
+		return common.NewBasicError("Unable to initialize SCION Messenger", err)
+	}
+	// FIXME(roosd): Hack to make Store.ChooseServer not panic.
+	// Remove when https://github.com/scionproto/scion/issues/2029 is resolved.
+	if err := snet.Init(config.General.Topology.ISD_AS, config.Sciond.Path, ""); err != nil {
+		return common.NewBasicError("Unable to initialize snet", err)
+	}
+	// FIXME(roosd): We need the actual type to set the signer and verifier.
+	// Remove when https://github.com/scionproto/scion/issues/2030 is resolved.
+	var ok bool
+	if msgr, ok = msgrI.(*messenger.Messenger); !ok {
+		return common.NewBasicError("Unsupported messenger type", nil,
+			"msgrI", common.TypeOf(msgrI))
+	}
+	msgr.AddHandler(infra.ChainRequest, config.state.Store.NewChainReqHandler(true))
+	msgr.AddHandler(infra.TRCRequest, config.state.Store.NewTRCReqHandler(true))
+	msgr.AddHandler(infra.Chain, config.state.Store.NewChainPushHandler())
+	msgr.AddHandler(infra.TRC, config.state.Store.NewTRCPushHandler())
+	msgr.UpdateSigner(config.state.GetSigner(), []infra.MessageType{infra.ChainIssueRequest})
+	msgr.UpdateVerifier(config.state.GetVerifier())
+	// Only core CS handles certificate reissuance requests.
+	if config.General.Topology.Core {
+		msgr.AddHandler(infra.ChainIssueRequest, &reiss.Handler{
+			State: config.state,
+			IA:    config.General.Topology.ISD_AS,
+		})
+	}
+	return nil
 }

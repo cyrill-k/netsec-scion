@@ -1,3 +1,18 @@
+// Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package cmn
 
 import (
@@ -10,10 +25,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
+	"github.com/scionproto/scion/go/lib/ctrl/path_mgmt"
+	"github.com/scionproto/scion/go/lib/env"
 	"github.com/scionproto/scion/go/lib/overlay"
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/scmp"
+	_ "github.com/scionproto/scion/go/lib/scrypto" // Make sure math/rand is seeded
 	"github.com/scionproto/scion/go/lib/snet"
 	"github.com/scionproto/scion/go/lib/sock/reliable"
 	"github.com/scionproto/scion/go/lib/spkt"
@@ -47,7 +66,6 @@ var (
 	Conn      *reliable.Conn
 	Mtu       uint16
 	PathEntry *sciond.PathReplyEntry
-	rnd       *rand.Rand
 	Stats     *ScmpStats
 	Start     time.Time
 )
@@ -62,9 +80,6 @@ func init() {
 	flag.Var((*snet.Addr)(&Remote), "remote", "(Mandatory for clients) address to connect to")
 	flag.Var((*snet.Addr)(&Bind), "bind", "address to bind to, if running behind NAT")
 	flag.Usage = scmpUsage
-	// Initialize random
-	seed := rand.NewSource(time.Now().UnixNano())
-	rnd = rand.New(seed)
 	Stats = &ScmpStats{}
 	Start = time.Now()
 }
@@ -83,9 +98,13 @@ flags:
 	flag.PrintDefaults()
 }
 
-func ParseFlags() string {
+func ParseFlags(version *bool) string {
 	var args []string
 	flag.Parse()
+	if *version {
+		fmt.Print(env.VersionInfo())
+		os.Exit(0)
+	}
 	args = flag.Args()
 	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "ERROR: Missing command\n")
@@ -113,11 +132,10 @@ func ValidateFlags() {
 		Fatal("Invalid remote address")
 	}
 	// scmp-tool does not use ports, thus they should not be set
-	// Still, the user could set port as 0 ie, ISD-AS,[host]:0 and be valid
-	if Local.L4Port != 0 {
+	if Local.Host.L4 != nil {
 		Fatal("Local port should not be provided")
 	}
-	if Remote.L4Port != 0 {
+	if Remote.Host.L4 != nil {
 		Fatal("Remote port should not be provided")
 	}
 	if Interval == 0 {
@@ -142,8 +160,8 @@ func NewSCMPPkt(t scmp.Type, info scmp.Info, ext common.Extension) *spkt.ScnPkt 
 	pkt := &spkt.ScnPkt{
 		DstIA:   Remote.IA,
 		SrcIA:   Local.IA,
-		DstHost: Remote.Host,
-		SrcHost: Local.Host,
+		DstHost: Remote.Host.L3,
+		SrcHost: Local.Host.L3,
 		Path:    Remote.Path,
 		HBHExt:  exts,
 		L4:      scmpHdr,
@@ -153,15 +171,51 @@ func NewSCMPPkt(t scmp.Type, info scmp.Info, ext common.Extension) *spkt.ScnPkt 
 }
 
 func NextHopAddr() net.Addr {
-	nhAddr := reliable.AppAddr{Addr: Remote.NextHopHost, Port: Remote.NextHopPort}
-	if Remote.NextHopHost == nil {
-		nhAddr = reliable.AppAddr{Addr: Remote.Host, Port: overlay.EndhostPort}
+	var nhAddr *overlay.OverlayAddr
+	if Remote.NextHop == nil {
+		l4 := addr.NewL4UDPInfo(overlay.EndhostPort)
+		nhAddr, _ = overlay.NewOverlayAddr(Remote.Host.L3, l4)
+	} else {
+		nhAddr = Remote.NextHop
 	}
-	return &nhAddr
+	return nhAddr
+}
+
+func Validate(pkt *spkt.ScnPkt) (*scmp.Hdr, *scmp.Payload, error) {
+	scmpHdr, ok := pkt.L4.(*scmp.Hdr)
+	if !ok {
+		return nil, nil,
+			common.NewBasicError("Not an SCMP header", nil, "type", common.TypeOf(pkt.L4))
+	}
+	scmpPld, ok := pkt.Pld.(*scmp.Payload)
+	if !ok {
+		return scmpHdr, nil,
+			common.NewBasicError("Not an SCMP payload", nil, "type", common.TypeOf(pkt.Pld))
+	}
+	if scmpHdr.Class != scmp.C_Path || scmpHdr.Type != scmp.T_P_RevokedIF {
+		return scmpHdr, scmpPld, nil
+	}
+	// Handle revocation
+	infoRev, ok := scmpPld.Info.(*scmp.InfoRevocation)
+	if !ok {
+		return scmpHdr, scmpPld,
+			common.NewBasicError("Failed to parse SCMP revocation Info", nil)
+	}
+	signedRevInfo, err := path_mgmt.NewSignedRevInfoFromRaw(infoRev.RawSRev)
+	if err != nil {
+		return scmpHdr, scmpPld,
+			common.NewBasicError("Failed to decode SCMP signed revocation Info", nil)
+	}
+	ri, err := signedRevInfo.RevInfo()
+	if err != nil {
+		return scmpHdr, scmpPld,
+			common.NewBasicError("Failed to decode SCMP revocation Info", nil)
+	}
+	return scmpHdr, scmpPld, common.NewBasicError("", nil, "Revocation", ri)
 }
 
 func Rand() uint64 {
-	return rnd.Uint64()
+	return rand.Uint64()
 }
 
 func UpdatePktTS(pkt *spkt.ScnPkt, ts time.Time) {
@@ -170,7 +224,7 @@ func UpdatePktTS(pkt *spkt.ScnPkt, ts time.Time) {
 }
 
 func Fatal(msg string, a ...interface{}) {
-	fmt.Printf("CRIT: "+msg+"\n", a...)
+	fmt.Fprintf(os.Stderr, "CRIT: "+msg+"\n", a...)
 	os.Exit(1)
 }
 

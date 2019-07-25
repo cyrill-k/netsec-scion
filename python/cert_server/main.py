@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # Copyright 2014 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +33,8 @@ from lib.crypto.certificate_chain import CertificateChain, verify_sig_chain_trc
 from lib.crypto.trc import TRC
 from lib.crypto.symcrypto import crypto_hash
 from lib.crypto.symcrypto import kdf
-from lib.defines import CERTIFICATE_SERVICE, GEN_CACHE_PATH
+from lib.crypto.util import get_master_key, MASTER_KEY_0
+from lib.defines import GEN_CACHE_PATH
 from lib.drkey.drkey_mgmt import (
     DRKeyMgmt,
     DRKeyReply,
@@ -64,6 +66,7 @@ from lib.types import (
     CertMgmtType,
     DRKeyMgmtType,
     PayloadClass,
+    ServiceType
 )
 from lib.util import (
     SCIONTime,
@@ -95,21 +98,23 @@ class CertServer(SCIONElement):
     """
     The SCION Certificate Server.
     """
-    SERVICE_TYPE = CERTIFICATE_SERVICE
+    SERVICE_TYPE = ServiceType.CS
     # ZK path for incoming cert chains
     ZK_CC_CACHE_PATH = "cert_chain_cache"
     # ZK path for incoming TRCs
     ZK_TRC_CACHE_PATH = "trc_cache"
     ZK_DRKEY_PATH = "drkey_cache"
 
-    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH, prom_export=None):
+    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH,
+                 prom_export=None, sciond_path=None):
         """
         :param str server_id: server identifier.
         :param str conf_dir: configuration directory.
         :param str prom_export: prometheus export address.
+        :param str sciond_path: path to sciond socket.
         """
         super().__init__(server_id, conf_dir, spki_cache_dir=spki_cache_dir,
-                         prom_export=prom_export)
+                         prom_export=prom_export, sciond_path=sciond_path)
         self.config = self._load_as_conf()
         cc_labels = {**self._labels, "type": "cc"} if self._labels else None
         trc_labels = {**self._labels, "type": "trc"} if self._labels else None
@@ -144,7 +149,7 @@ class CertServer(SCIONElement):
 
         zkid = ZkID.from_values(self.addr.isd_as, self.id,
                                 [(self.addr.host, self._port)]).pack()
-        self.zk = Zookeeper(self.topology.isd_as, CERTIFICATE_SERVICE,
+        self.zk = Zookeeper(self.topology.isd_as, self.SERVICE_TYPE,
                             zkid, self.topology.zookeepers)
         self.zk.retry("Joining party", self.zk.party_setup)
         self.trc_cache = ZkSharedCache(self.zk, self.ZK_TRC_CACHE_PATH,
@@ -153,6 +158,7 @@ class CertServer(SCIONElement):
                                       self._cached_certs_handler)
         self.drkey_cache = ZkSharedCache(self.zk, self.ZK_DRKEY_PATH,
                                          self._cached_drkeys_handler)
+        self.master_key = get_master_key(self.conf_dir, MASTER_KEY_0)
         self.signing_key = get_sig_key(self.conf_dir)
         self.private_key = get_enc_key(self.conf_dir)
         self.drkey_secrets = ExpiringDict(DRKEY_MAX_SV, DRKEY_MAX_TTL)
@@ -269,10 +275,14 @@ class CertServer(SCIONElement):
             self._share_object(rep.chain, is_trc=False)
         # Reply to all requests for this certificate chain
         self.cc_requests.put((ia_ver, None))
+        # If the new version is the max version also reply to NEWEST_VERSION requests.
+        max_ver = self.trust_store.get_cert(ia_ver[0]).get_leaf_isd_as_ver()[1]
+        if max_ver == ia_ver[1]:
+            ia_ver0 = (ia_ver[0], CertChainRequest.NEWEST_VERSION)
+            self.cc_requests.put((ia_ver0, None))
 
     def _check_cc(self, key):
         isd_as, ver = key
-        ver = None if ver == CertChainRequest.NEWEST_VERSION else ver
         cert_chain = self.trust_store.get_cert(isd_as, ver)
         if cert_chain:
             return True
@@ -301,7 +311,6 @@ class CertServer(SCIONElement):
 
     def _reply_cc(self, key, req_info):
         isd_as, ver = key
-        ver = None if ver == CertChainRequest.NEWEST_VERSION else ver
         meta = req_info[0]
         req_id = req_info[2]
         cert_chain = self.trust_store.get_cert(isd_as, ver)
@@ -348,6 +357,10 @@ class CertServer(SCIONElement):
             self._share_object(trc_rep.trc, is_trc=True)
         # Reply to all requests for this TRC
         self.trc_requests.put(((isd, ver), None))
+        # If the new version is the max version also reply to NEWEST_VERSION requests.
+        max_ver = self.trust_store.get_trc(isd).get_isd_ver()[1]
+        if max_ver == ver:
+            self.trc_requests.put(((isd, TRCRequest.NEWEST_VERSION), None))
 
     def _check_trc(self, key):
         isd, ver = key
@@ -571,7 +584,7 @@ class CertServer(SCIONElement):
         """
         sv = self.drkey_secrets.get(exp_time)
         if not sv:
-            sv = DRKeySecretValue(kdf(self.config.master_as_key, b"Derive DRKey Key"), exp_time)
+            sv = DRKeySecretValue(kdf(self.master_key, b"Derive DRKey Key"), exp_time)
             self.drkey_secrets[sv.exp_time] = sv
         return sv
 

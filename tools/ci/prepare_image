@@ -1,0 +1,6 @@
+#!/bin/bash
+
+set -ex
+
+docker pull ethznetsec/scion_base@sha256:${1:?"Image hash not specified!"}
+docker tag ethznetsec/scion_base@sha256:$1 scion_base:latest

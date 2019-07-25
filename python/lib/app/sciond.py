@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # Copyright 2017 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +32,6 @@ from external.expiring_dict import ExpiringDict
 from lib.defines import (
     SCION_UDP_EH_DATA_PORT,
     SCIOND_API_DEFAULT_SOCK,
-    SCIOND_API_PATH_ENV_VAR,
     SCIOND_API_SOCKDIR,
 )
 from lib.errors import SCIONBaseError, SCIONIOError, SCIONParseError
@@ -86,9 +86,8 @@ class SCIONDResponseError(SCIONDLibError):
 
 
 class PathRequestFlags:  # pragma: no cover
-    def __init__(self, flush=False, sibra=False):
-        self.flush = flush
-        self.sibra = sibra
+    def __init__(self, refresh=False):
+        self.refresh = refresh
 
 
 class _Counter:  # pragma: no cover
@@ -121,10 +120,10 @@ class SCIONDConnector:
 
     def get_paths(self, dst_ia, src_ia, max_paths, flags=None):
         if not flags:
-            flags = PathRequestFlags(flush=False, sibra=False)
+            flags = PathRequestFlags(refresh=False)
         req_id = self._req_id.inc()
         request = SCIONDMsg(SCIONDPathRequest.from_values(
-            dst_ia, src_ia, max_paths, flags.flush, flags.sibra), req_id)
+            dst_ia, src_ia, max_paths, flags.refresh), req_id)
         with closing(self._create_socket()) as socket:
             if not socket.send(request.pack()):
                 raise SCIONDRequestError
@@ -233,10 +232,14 @@ class SCIONDConnector:
         return HostInfo.from_values([host], SCION_UDP_EH_DATA_PORT)
 
     def send_rev_notification(self, srev_info):  # pragma: no cover
-        rev_not = SCIONDMsg(SCIONDRevNotification.from_values(srev_info), self._req_id.inc())
+        req_id = self._req_id.inc()
+        rev_not = SCIONDMsg(SCIONDRevNotification.from_values(srev_info), req_id)
         with closing(self._create_socket()) as socket:
             if not socket.send(rev_not.pack()):
                 raise SCIONDRequestError
+            response = self._get_response(socket, req_id, SMT.REVOCATIONREPLY)
+            return response.p.result
+        return None
 
     def _create_socket(self):  # pragma: no cover
         socket = ReliableSocket()
@@ -305,16 +308,11 @@ def init(api_addr=None):  # pragma: no cover
     global _counter
     if not _counter:
         _counter = _Counter(random.randint(0, 2**32 - 1))
-    api_addr = api_addr or _get_api_addr()
+    api_addr = api_addr or get_default_sciond_path()
     connector = SCIONDConnector(api_addr, _counter)
     if not _connector:
         _connector = connector
     return connector
-
-
-def _get_api_addr():  # pragma: no cover
-    return os.getenv(SCIOND_API_PATH_ENV_VAR,
-                     os.path.join(SCIOND_API_SOCKDIR, SCIOND_API_DEFAULT_SOCK))
 
 
 def get_paths(dst_ia, src_ia=None, max_paths=5, flags=None, connector=None):  # pragma: no cover
@@ -409,7 +407,7 @@ def send_rev_notification(srev_info, connector=None):  # pragma: no cover
         connector = _connector
     if not connector:
         raise SCIONDLibNotInitializedError
-    connector.send_rev_notification(srev_info)
+    return connector.send_rev_notification(srev_info)
 
 
 def get_segtype_hops(seg_type, connector=None):  # pragma: no cover
@@ -437,4 +435,4 @@ def get_default_sciond_path(ia=None):
         sock_path = SCIOND_API_DEFAULT_SOCK
     else:
         sock_path = "sd%s.sock" % (ia.file_fmt())
-    return "%s/%s" % (SCIOND_API_SOCKDIR, sock_path)
+    return os.path.join(SCIOND_API_SOCKDIR, sock_path)

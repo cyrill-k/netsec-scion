@@ -41,8 +41,9 @@
 // header.
 //
 // Important: not draining SCMP errors via Read calls can cause the dispatcher
-// to block (see Issue #1278). To prevent this on a Conn object with only Write
-// calls, run a separate goroutine that continuously calls Read on the Conn.
+// to shutdown the socket (see https://github.com/scionproto/scion/pull/1356).
+// To prevent this on a Conn object with only Write calls, run a separate
+// goroutine that continuously calls Read on the Conn.
 package snet
 
 import (
@@ -59,12 +60,12 @@ import (
 
 var (
 	// Default SCION networking context for package-level Dial and Listen
-	DefNetwork *Network
+	DefNetwork *SCIONNetwork
 )
 
 // Init initializes the default SCION networking context.
-func Init(ia addr.IA, sPath string, dPath string) error {
-	network, err := NewNetwork(ia, sPath, dPath)
+func Init(ia addr.IA, sciondPath string, dispatcherPath string) error {
+	network, err := NewNetwork(ia, sciondPath, dispatcherPath)
 	if err != nil {
 		return err
 	}
@@ -72,7 +73,7 @@ func Init(ia addr.IA, sPath string, dPath string) error {
 }
 
 // InitWithNetwork initializes snet with the provided SCION networking context.
-func InitWithNetwork(network *Network) error {
+func InitWithNetwork(network *SCIONNetwork) error {
 	if DefNetwork != nil {
 		return common.NewBasicError("Cannot initialize global SCION network twice", nil)
 	}
@@ -88,69 +89,85 @@ func IA() addr.IA {
 	return DefNetwork.localIA
 }
 
+var _ Network = (*SCIONNetwork)(nil)
+
 // SCION networking context, containing local ISD-AS, SCIOND, Dispatcher and
 // Path resolver.
-type Network struct {
-	sciond         sciond.Service
-	sciondPath     string
+type SCIONNetwork struct {
 	dispatcherPath string
-	pathResolver   *pathmgr.PR
-	localIA        addr.IA
+	// pathResolver references the default source of paths for a Network. This
+	// is set to nil when operating on a SCIOND-less Network.
+	pathResolver pathmgr.Resolver
+	localIA      addr.IA
 }
 
-// NewNetworkBasic creates a minimal networking context without a path resolver.
-// It is meant to be amended with a custom path resolver.
-func NewNetworkBasic(ia addr.IA, sPath string, dPath string) *Network {
-	return &Network{
-		sciond:         sciond.NewService(sPath),
-		sciondPath:     sPath,
-		dispatcherPath: dPath,
+// NewNetworkWithPR creates a new networking context with path resolver pr. A
+// nil path resolver means the Network will run without SCIOND.
+func NewNetworkWithPR(ia addr.IA, dispatcherPath string, pr pathmgr.Resolver) *SCIONNetwork {
+	if dispatcherPath == "" {
+		dispatcherPath = reliable.DefaultDispPath
+	}
+	return &SCIONNetwork{
+		dispatcherPath: dispatcherPath,
+		pathResolver:   pr,
 		localIA:        ia,
 	}
 }
 
 // NewNetwork creates a new networking context, on which future Dial or Listen
-// calls can be made. The new connections use the SCIOND server at sPath, the
-// dispatcher at dPath, and ia for the local ISD-AS.
-func NewNetwork(ia addr.IA, sPath string, dPath string) (*Network, error) {
-	network := NewNetworkBasic(ia, sPath, dPath)
-	timers := &pathmgr.Timers{
-		NormalRefire: time.Minute,
-		ErrorRefire:  3 * time.Second,
-		MaxAge:       time.Hour,
+// calls can be made. The new connections use the SCIOND server at sciondPath,
+// the dispatcher at dispatcherPath, and ia for the local ISD-AS.
+//
+// If sciondPath is the empty string, the network will run without SCIOND. In
+// this mode of operation, the app is fully responsible with supplying paths
+// for sent traffic.
+func NewNetwork(ia addr.IA, sciondPath string, dispatcherPath string) (*SCIONNetwork, error) {
+	var pathResolver pathmgr.Resolver
+	if sciondPath != "" {
+		sciondConn, err := sciond.NewService(sciondPath, true).Connect()
+		if err != nil {
+			return nil, common.NewBasicError("Unable to initialize SCIOND service", err)
+		}
+		pathResolver = pathmgr.New(
+			sciondConn,
+			pathmgr.Timers{
+				NormalRefire: time.Minute,
+				ErrorRefire:  3 * time.Second,
+			},
+			log.Root(),
+		)
 	}
-	pathResolver, err := pathmgr.New(network.sciond, timers, log.Root())
-	if err != nil {
-		return nil, common.NewBasicError("Unable to initialize path resolver", err)
-	}
-	network.pathResolver = pathResolver
-	return network, nil
+	return NewNetworkWithPR(ia, dispatcherPath, pathResolver), nil
 }
 
 // DialSCION returns a SCION connection to raddr. Nil values for laddr are not
 // supported yet.  Parameter network must be "udp4". The returned connection's
 // Read and Write methods can be used to receive and send SCION packets.
-func (n *Network) DialSCION(network string, laddr *Addr, raddr *Addr) (*Conn, error) {
-	return n.DialSCIONWithBindSVC(network, laddr, raddr, nil, addr.SvcNone)
+//
+// A timeout of 0 means infinite timeout.
+func (n *SCIONNetwork) DialSCION(network string, laddr, raddr *Addr,
+	timeout time.Duration) (Conn, error) {
+
+	return n.DialSCIONWithBindSVC(network, laddr, raddr, nil, addr.SvcNone, timeout)
 }
 
 // DialSCIONWithBindSVC returns a SCION connection to raddr. Nil values for laddr are not
 // supported yet.  Parameter network must be "udp4". The returned connection's
 // Read and Write methods can be used to receive and send SCION packets.
-func (n *Network) DialSCIONWithBindSVC(network string, laddr, raddr, baddr *Addr,
-	svc addr.HostSVC) (*Conn, error) {
+//
+// A timeout of 0 means infinite timeout.
+func (n *SCIONNetwork) DialSCIONWithBindSVC(network string, laddr, raddr, baddr *Addr,
+	svc addr.HostSVC, timeout time.Duration) (Conn, error) {
+
 	if raddr == nil {
 		return nil, common.NewBasicError("Unable to dial to nil remote", nil)
 	}
-	conn, err := n.ListenSCIONWithBindSVC(network, laddr, baddr, svc)
+	conn, err := n.ListenSCIONWithBindSVC(network, laddr, baddr, svc, timeout)
 	if err != nil {
 		return nil, err
 	}
-	conn.raddr = raddr.Copy()
-	conn.sp, err = n.pathResolver.Watch(conn.laddr.IA, conn.raddr.IA)
-	if err != nil {
-		return nil, common.NewBasicError("Unable to establish path", err)
-	}
+	snetConn := conn.(*SCIONConn)
+	snetConn.raddr = raddr.Copy()
 	return conn, nil
 }
 
@@ -158,19 +175,22 @@ func (n *Network) DialSCIONWithBindSVC(network string, laddr, raddr, baddr *Addr
 // not supported yet. The returned connection's ReadFrom and WriteTo methods
 // can be used to receive and send SCION packets with per-packet addressing.
 // Parameter network must be "udp4".
-func (n *Network) ListenSCION(network string, laddr *Addr) (*Conn, error) {
-	return n.ListenSCIONWithBindSVC(network, laddr, nil, addr.SvcNone)
+//
+// A timeout of 0 means infinite timeout.
+func (n *SCIONNetwork) ListenSCION(network string, laddr *Addr,
+	timeout time.Duration) (Conn, error) {
+
+	return n.ListenSCIONWithBindSVC(network, laddr, nil, addr.SvcNone, timeout)
 }
 
 // ListenSCIONWithBindSVC registers laddr with the dispatcher. Nil values for laddr are
 // not supported yet. The returned connection's ReadFrom and WriteTo methods
 // can be used to receive and send SCION packets with per-packet addressing.
 // Parameter network must be "udp4".
-func (n *Network) ListenSCIONWithBindSVC(network string, laddr, baddr *Addr,
-	svc addr.HostSVC) (*Conn, error) {
-	if network != "udp4" {
-		return nil, common.NewBasicError("Network not implemented", nil, "net", network)
-	}
+//
+// A timeout of 0 means infinite timeout.
+func (n *SCIONNetwork) ListenSCIONWithBindSVC(network string, laddr, baddr *Addr,
+	svc addr.HostSVC, timeout time.Duration) (Conn, error) {
 	// FIXME(scrye): If no local address is specified, we want to
 	// bind to the address of the outbound interface on a random
 	// free port. However, the current dispatcher version cannot
@@ -178,88 +198,99 @@ func (n *Network) ListenSCIONWithBindSVC(network string, laddr, baddr *Addr,
 	// normal operating system semantics for binding on 0.0.0.0 (it
 	// considers it to be a fixed address instead of a wildcard). To avoid
 	// misuse, disallow binding to nil or 0.0.0.0 addresses for now.
+	var l3Type addr.HostAddrType
+	var l4Type common.L4ProtocolType
+	var defL4 addr.L4Info
+	switch network {
+	case "udp4":
+		l3Type = addr.HostTypeIPv4
+		l4Type = common.L4UDP
+		defL4 = addr.NewL4UDPInfo(0)
+	default:
+		return nil, common.NewBasicError("Network not implemented", nil, "net", network)
+	}
 	if laddr == nil {
 		return nil, common.NewBasicError("Nil laddr not supported", nil)
 	}
-	if laddr.Host.Type() != addr.HostTypeIPv4 {
+	if laddr.Host == nil {
+		return nil, common.NewBasicError("Nil Host laddr not supported", nil)
+	}
+	if laddr.Host.L3 == nil {
+		return nil, common.NewBasicError("Nil Host L3 laddr not supported", nil)
+	}
+	if laddr.Host.L3.Type() != l3Type {
 		return nil, common.NewBasicError("Supplied local address does not match network", nil,
-			"expected", addr.HostTypeIPv4, "actual", laddr.Host.Type())
+			"expected L3", l3Type, "actual L3", laddr.Host.L3.Type())
 	}
-	if laddr.Host.IP().Equal(net.IPv4zero) {
-		return nil, common.NewBasicError("Binding to 0.0.0.0 not supported", nil)
+	if laddr.Host.L3.IP().IsUnspecified() {
+		return nil, common.NewBasicError("Binding to unspecified address not supported", nil)
 	}
-	conn := &Conn{
-		net:        network,
-		scionNet:   n,
-		recvBuffer: make(common.RawBytes, BufSize),
-		sendBuffer: make(common.RawBytes, BufSize),
-		svc:        svc}
-
+	if laddr.Host.L4 == nil {
+		// If no port has been specified, default to 0 to get a random port from the dispatcher
+		laddr.Host.L4 = defL4
+	}
+	if laddr.Host.L4.Type() != l4Type {
+		return nil, common.NewBasicError("Supplied local address does not match network", nil,
+			"expected L4", l4Type, "actual L4", laddr.Host.L4.Type())
+	}
+	conn := &scionConnBase{
+		net:      network,
+		scionNet: n,
+		svc:      svc,
+	}
 	// Initialize local bind address
-	regAddr := &reliable.AppAddr{}
-	var bindAddr *reliable.AppAddr
-	// NOTE: keep nil address logic for now, even though we do not support
-	// it yet
+	// NOTE: keep nil address logic for now, even though we do not support it yet
 	if laddr != nil {
 		conn.laddr = laddr.Copy()
-		regAddr.Port = conn.laddr.L4Port
 	} else {
+		l4 := addr.NewL4UDPInfo(0)
 		conn.laddr = &Addr{}
-		conn.laddr.Host = addr.HostFromIP(net.IPv4zero)
+		conn.laddr.Host = &addr.AppAddr{L3: addr.HostIPv4(net.IPv4zero), L4: l4}
 		conn.laddr.IA = conn.scionNet.localIA
 	}
-	regAddr.Addr = conn.laddr.Host
-
 	if conn.laddr.IA.IsZero() {
 		conn.laddr.IA = n.IA()
 	}
-
 	if !conn.laddr.IA.Eq(conn.scionNet.localIA) {
 		return nil, common.NewBasicError("Unable to listen on non-local IA", nil,
 			"expected", conn.scionNet.localIA, "actual", conn.laddr.IA, "type", "public")
 	}
-
+	var bindAddr *addr.AppAddr
 	if baddr != nil {
 		conn.baddr = baddr.Copy()
-		bindAddr = &reliable.AppAddr{Addr: conn.baddr.Host, Port: conn.baddr.L4Port}
+		bindAddr = baddr.Host
 		if !conn.baddr.IA.Eq(conn.scionNet.localIA) {
 			return nil, common.NewBasicError("Unable to listen on non-local IA", nil,
 				"expected", conn.scionNet.localIA, "actual", conn.baddr.IA, "type", "bind")
 		}
 	}
-
-	rconn, port, err := reliable.Register(conn.scionNet.dispatcherPath,
-		conn.laddr.IA, regAddr, bindAddr, svc)
+	rconn, port, err := reliable.RegisterTimeout(conn.scionNet.dispatcherPath,
+		conn.laddr.IA, conn.laddr.Host, bindAddr, svc, timeout)
 	if err != nil {
-		return nil, common.NewBasicError("Unable to register with dispatcher", err)
+		return nil, err
 	}
-	log.Info("Registered with dispatcher", "ia", conn.scionNet.localIA, "host", regAddr.Addr,
-		"port", port)
-	conn.laddr.L4Port = port
-	conn.conn = rconn
-	return conn, nil
+	if port != conn.laddr.Host.L4.Port() {
+		// Update port
+		conn.laddr.Host.L4 = addr.NewL4UDPInfo(port)
+	}
+	log.Debug("Registered with dispatcher", "addr", conn.laddr)
+	return newSCIONConn(conn, n.pathResolver, rconn), nil
 }
 
 // PathResolver returns the pathmgr.PR that the network is using.
-func (n *Network) PathResolver() *pathmgr.PR {
+func (n *SCIONNetwork) PathResolver() pathmgr.Resolver {
 	return n.pathResolver
 }
 
-// SetPathResolver set the pathmgr.PR that the networking is using. It can only
-// be set once and will be ignored if there is already a path resolver set.
-func (n *Network) SetPathResolver(resolver *pathmgr.PR) {
+// Sciond returns the sciond API endpoint that the network is using.
+func (n *SCIONNetwork) Sciond() sciond.Connector {
 	if n.pathResolver != nil {
-		return
+		return n.pathResolver.Sciond()
 	}
-	n.pathResolver = resolver
-}
-
-// Sciond returns the sciond.Service that the network is using.
-func (n *Network) Sciond() sciond.Service {
-	return n.sciond
+	return nil
 }
 
 // IA returns the ISD-AS assigned to n
-func (n *Network) IA() addr.IA {
+func (n *SCIONNetwork) IA() addr.IA {
 	return n.localIA
 }

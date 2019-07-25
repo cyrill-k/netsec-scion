@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,32 +16,22 @@
 package sigcmn
 
 import (
-	"flag"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
+	"github.com/scionproto/scion/go/lib/env"
 	"github.com/scionproto/scion/go/lib/pathmgr"
-	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/go/sig/internal/sigconfig"
 	"github.com/scionproto/scion/go/sig/mgmt"
 )
 
 const (
-	DefaultCtrlPort  = 10081
-	DefaultEncapPort = 10080
-	MaxPort          = (1 << 16) - 1
-	SIGHdrSize       = 8
-)
-
-var (
-	CtrlPort       = flag.Int("ctrlport", DefaultCtrlPort, "control data port (e.g., keepalives)")
-	EncapPort      = flag.Int("encapport", DefaultEncapPort, "encapsulation data port")
-	sciondPath     = flag.String("sciond", "", "SCIOND socket path")
-	dispatcherPath = flag.String("dispatcher", "/run/shm/dispatcher/default.sock",
-		"SCION Dispatcher path")
-	SigTun = flag.String("tun", "sig", "Name of TUN device to create")
+	MaxPort    = (1 << 16) - 1
+	SIGHdrSize = 8
 )
 
 var (
@@ -49,51 +40,39 @@ var (
 )
 
 var (
-	IA       addr.IA
-	Host     addr.HostAddr
-	PathMgr  *pathmgr.PR
-	CtrlConn *snet.Conn
-	MgmtAddr *mgmt.Addr
+	IA        addr.IA
+	Host      addr.HostAddr
+	PathMgr   pathmgr.Resolver
+	CtrlConn  snet.Conn
+	MgmtAddr  *mgmt.Addr
+	encapPort uint16
 )
 
-func Init(ia addr.IA, ip net.IP) error {
+func Init(cfg sigconfig.Conf, sdCfg env.SciondClient) error {
 	var err error
-	IA = ia
-	Host = addr.HostFromIP(ip)
-	if err = ValidatePort("local ctrl", *CtrlPort); err != nil {
-		return err
-	}
-	if err = ValidatePort("local encap", *EncapPort); err != nil {
-		return err
-	}
-	MgmtAddr = mgmt.NewAddr(Host, uint16(*CtrlPort), uint16(*EncapPort))
-	if *sciondPath == "" {
-		*sciondPath = sciond.GetDefaultSCIONDPath(&ia)
-	}
+	IA = cfg.IA
+	Host = addr.HostFromIP(cfg.IP)
+	MgmtAddr = mgmt.NewAddr(Host, cfg.CtrlPort, cfg.EncapPort)
+	encapPort = cfg.EncapPort
+
 	// Initialize SCION local networking module
-	err = snet.Init(ia, *sciondPath, *dispatcherPath)
+	err = initSNET(cfg, sdCfg)
 	if err != nil {
 		return common.NewBasicError("Error creating local SCION Network context", err)
 	}
 	PathMgr = snet.DefNetwork.PathResolver()
-	CtrlConn, err = snet.ListenSCION(
-		"udp4", &snet.Addr{IA: IA, Host: Host, L4Port: uint16(*CtrlPort)})
+	l4 := addr.NewL4UDPInfo(cfg.CtrlPort)
+	CtrlConn, err = snet.ListenSCIONWithBindSVC("udp4",
+		&snet.Addr{IA: IA, Host: &addr.AppAddr{L3: Host, L4: l4}}, nil, addr.SvcSIG)
 	if err != nil {
 		return common.NewBasicError("Error creating ctrl socket", err)
 	}
 	return nil
 }
 
-func CtrlSnetAddr() *snet.Addr {
-	return &snet.Addr{
-		IA: IA, Host: Host, L4Port: uint16(*CtrlPort),
-	}
-}
-
 func EncapSnetAddr() *snet.Addr {
-	return &snet.Addr{
-		IA: IA, Host: Host, L4Port: uint16(*EncapPort),
-	}
+	l4 := addr.NewL4UDPInfo(uint16(encapPort))
+	return &snet.Addr{IA: IA, Host: &addr.AppAddr{L3: Host, L4: l4}}
 }
 
 func ValidatePort(desc string, port int) error {
@@ -102,4 +81,27 @@ func ValidatePort(desc string, port int) error {
 			"min", 1, "max", MaxPort, "actual", port)
 	}
 	return nil
+}
+
+// initSNET initializes snet. Tries in second interval until sdCfg.InitialConnectPeriod is up.
+// Copied from infraenv.initNetwork. Should be adapted once we have
+// https://github.com/scionproto/scion/issues/1974
+func initSNET(cfg sigconfig.Conf, sdCfg env.SciondClient) error {
+	var err error
+	ticker := time.NewTicker(time.Second)
+	timer := time.NewTimer(sdCfg.InitialConnectPeriod.Duration)
+	defer ticker.Stop()
+	defer timer.Stop()
+Top:
+	for {
+		if err = snet.Init(cfg.IA, sdCfg.Path, cfg.Dispatcher); err == nil {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			break Top
+		}
+	}
+	return err
 }

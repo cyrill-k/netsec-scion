@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,7 +115,7 @@ Top:
 			rp.DirFrom = s.Dir
 			rp.Free = free // Set free callback.
 			if i == pktsRead-1 {
-				// Only bother setting the Guage once per ReadBatch. Use
+				// Only bother setting the Gauge once per ReadBatch. Use
 				// the last read as internally the kernel calls recvmsg
 				// multiple times, so it will have the latest value.
 				inputRcvOvfl.Set(float64(meta.RcvOvfl))
@@ -125,9 +126,8 @@ Top:
 			rp.Ingress.Dst = dst
 			// Make a copy, as meta.Src will be overwritten.
 			src := meta.Src
-			rp.Ingress.Src = &src
-			rp.Ingress.IfIDs = s.Ifids
-			rp.Ingress.LocIdx = s.LocIdx
+			rp.Ingress.Src = src
+			rp.Ingress.IfID = s.Ifid
 			rp.Ingress.Sock = sock
 			inputBytes.Add(float64(msg.N))
 			inputPktSize.Observe(float64(msg.N))
@@ -146,7 +146,9 @@ Top:
 
 // posixPrepInput refills pkts if it's below inputLowBufCnt, and sets the msgs
 // Buffers references to point to the corresponding buffers in pkts.
-func (r *Router) posixPrepInput(pkts ringbuf.EntryList, msgs []ipv4.Message) (ringbuf.EntryList, bool) {
+func (r *Router) posixPrepInput(pkts ringbuf.EntryList,
+	msgs []ipv4.Message) (ringbuf.EntryList, bool) {
+
 	if len(pkts) < inputLowBufCnt {
 		before := len(pkts)
 		pkts = pkts[:cap(pkts)]
@@ -264,6 +266,7 @@ func (r *Router) posixOutput(s *rctx.Sock, _, stopped chan struct{}) {
 // Buffers and Addr based on the corresponding entries in epkts.
 func (r *Router) posixPrepOutput(epkts ringbuf.EntryList, msgs []ipv4.Message,
 	ring *ringbuf.Ring, connected bool) (ringbuf.EntryList, bool) {
+
 	if len(epkts) == 0 {
 		epkts = epkts[:cap(epkts)]
 		n, _ := ring.Read(epkts, true)
@@ -283,8 +286,8 @@ func (r *Router) posixPrepOutput(epkts ringbuf.EntryList, msgs []ipv4.Message,
 		if !connected {
 			// Unconnected socket, use supplied address
 			uaddr := msgs[i].Addr.(*net.UDPAddr)
-			uaddr.IP = erp.Dst.IP
-			uaddr.Port = erp.Dst.OverlayPort
+			uaddr.IP = erp.Dst.L3().IP()
+			uaddr.Port = int(erp.Dst.L4().Port())
 		}
 	}
 	return epkts, true

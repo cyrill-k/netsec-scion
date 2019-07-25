@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,15 @@ package infra
 
 import (
 	"context"
+	"fmt"
 	"net"
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/crypto/cert"
-	"github.com/scionproto/scion/go/lib/crypto/trc"
 	"github.com/scionproto/scion/go/lib/ctrl/cert_mgmt"
+	"github.com/scionproto/scion/go/lib/ctrl/path_mgmt"
+	"github.com/scionproto/scion/go/lib/scrypto/cert"
+	"github.com/scionproto/scion/go/lib/scrypto/trc"
 	"github.com/scionproto/scion/go/proto"
 )
 
@@ -64,15 +66,15 @@ func (f HandlerFunc) Handle(r *Request) {
 // exchange initiated by the local node. A Request includes its associated
 // context.
 type Request struct {
-	// The inner proto.Cerealizable message, as supported by
+	// Message is the inner proto.Cerealizable message, as supported by
 	// messenger.Messenger (e.g., a *cert_mgmt.ChainReq). For information about
 	// possible messages, see the package documentation for that package.
 	Message proto.Cerealizable
-	// The top-level SignedCtrlPld message read from the wire
+	// FullMessage is the top-level SignedCtrlPld message read from the wire
 	FullMessage proto.Cerealizable
-	// The node that sent this request
+	// Peer is the node that sent this request
 	Peer net.Addr
-
+	// ID is the CtrlPld top-level ID.
 	ID uint64
 	// ctx is a server context, used in handlers when receiving messages from
 	// the network.
@@ -114,6 +116,69 @@ func NewContextWithMessenger(ctx context.Context, msger Messenger) context.Conte
 	return context.WithValue(ctx, messengerContextKey, msger)
 }
 
+type MessageType int
+
+const (
+	None MessageType = iota
+	TRC
+	TRCRequest
+	Chain
+	ChainRequest
+	IfStateInfos
+	SegChangesReq
+	SegChangesReply
+	SegChangesIdReq
+	SegChangesIdReply
+	SegReg
+	SegRequest
+	SegReply
+	SegRev
+	SegSync
+	ChainIssueRequest
+	ChainIssueReply
+)
+
+func (mt MessageType) String() string {
+	switch mt {
+	case None:
+		return "None"
+	case ChainRequest:
+		return "ChainRequest"
+	case Chain:
+		return "Chain"
+	case TRCRequest:
+		return "TRCRequest"
+	case TRC:
+		return "TRC"
+	case IfStateInfos:
+		return "IFStateInfos"
+	case SegChangesReq:
+		return "SegChangesReq"
+	case SegChangesReply:
+		return "SegChangesReply"
+	case SegChangesIdReq:
+		return "SegChangesIdReq"
+	case SegChangesIdReply:
+		return "SegChangesIdReply"
+	case SegReg:
+		return "SegReg"
+	case SegRequest:
+		return "SegRequest"
+	case SegReply:
+		return "SegReply"
+	case SegRev:
+		return "SegRev"
+	case SegSync:
+		return "SegSync"
+	case ChainIssueRequest:
+		return "ChainIssueRequest"
+	case ChainIssueReply:
+		return "ChainIssueReply"
+	default:
+		return fmt.Sprintf("Unknown (%d)", mt)
+	}
+}
+
 type Messenger interface {
 	GetTRC(ctx context.Context, msg *cert_mgmt.TRCReq, a net.Addr,
 		id uint64) (*cert_mgmt.TRC, error)
@@ -121,7 +186,23 @@ type Messenger interface {
 	GetCertChain(ctx context.Context, msg *cert_mgmt.ChainReq, a net.Addr,
 		id uint64) (*cert_mgmt.Chain, error)
 	SendCertChain(ctx context.Context, msg *cert_mgmt.Chain, a net.Addr, id uint64) error
-	AddHandler(msgType string, h Handler)
+	GetSegs(ctx context.Context, msg *path_mgmt.SegReq, a net.Addr,
+		id uint64) (*path_mgmt.SegReply, error)
+	SendSegReply(ctx context.Context, msg *path_mgmt.SegReply, a net.Addr, id uint64) error
+	SendSegSync(ctx context.Context, msg *path_mgmt.SegSync, a net.Addr, id uint64) error
+	GetSegChangesIds(ctx context.Context, msg *path_mgmt.SegChangesIdReq,
+		a net.Addr, id uint64) (*path_mgmt.SegChangesIdReply, error)
+	SendSegChangesIdReply(ctx context.Context,
+		msg *path_mgmt.SegChangesIdReply, a net.Addr, id uint64) error
+	GetSegChanges(ctx context.Context, msg *path_mgmt.SegChangesReq,
+		a net.Addr, id uint64) (*path_mgmt.SegChangesReply, error)
+	SendSegChangesReply(ctx context.Context,
+		msg *path_mgmt.SegChangesReply, a net.Addr, id uint64) error
+	RequestChainIssue(ctx context.Context, msg *cert_mgmt.ChainIssReq, a net.Addr,
+		id uint64) (*cert_mgmt.ChainIssRep, error)
+	SendChainIssueReply(ctx context.Context, msg *cert_mgmt.ChainIssRep, a net.Addr,
+		id uint64) error
+	AddHandler(msgType MessageType, h Handler)
 	ListenAndServe()
 	CloseServer() error
 }
@@ -132,8 +213,9 @@ func MessengerFromContext(ctx context.Context) (Messenger, bool) {
 }
 
 type TrustStore interface {
-	GetValidChain(ctx context.Context, ia addr.IA, trail ...addr.ISD) (*cert.Chain, error)
-	GetValidTRC(ctx context.Context, isd addr.ISD, trail ...addr.ISD) (*trc.TRC, error)
+	GetValidChain(ctx context.Context, ia addr.IA, source net.Addr) (*cert.Chain, error)
+	GetValidTRC(ctx context.Context, isd addr.ISD, source net.Addr) (*trc.TRC, error)
+	GetValidCachedTRC(ctx context.Context, isd addr.ISD) (*trc.TRC, error)
 	GetChain(ctx context.Context, ia addr.IA, version uint64) (*cert.Chain, error)
 	GetTRC(ctx context.Context, isd addr.ISD, version uint64) (*trc.TRC, error)
 	NewTRCReqHandler(recurseAllowed bool) Handler

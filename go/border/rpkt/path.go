@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,41 +27,34 @@ import (
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/scmp"
 	"github.com/scionproto/scion/go/lib/spath"
+	"github.com/scionproto/scion/go/proto"
 )
 
 // validatePath validates the path header.
 func (rp *RtrPkt) validatePath(dirFrom rcmn.Dir) error {
-	if assert.On {
-		assert.Mustf(rp.ifCurr != nil, rp.ErrStr, "rp.ifCurr must not be nil")
+	// First check if there is a path
+	if rp.infoF == nil || rp.hopF == nil {
+		return common.NewBasicError("Path required",
+			scmp.NewError(scmp.C_Path, scmp.T_P_PathRequired, nil, nil))
 	}
-	// First check to make sure the current interface is known and not revoked.
+	// There is a path, so ifCurr will be set
 	if err := rp.validateLocalIF(rp.ifCurr); err != nil {
 		return err
 	}
-	if rp.infoF == nil || rp.hopF == nil {
-		// If there's no path, then there's nothing to check.
-		if rp.DirTo == rcmn.DirSelf {
-			// An empty path is legitimate when the packet's destination is
-			// this router.
-			return nil
+	// Check for shorcuts in packets from core links
+	if rp.infoF.Shortcut {
+		currentLinkType := rp.Ctx.Conf.Net.IFs[*rp.ifCurr].Type
+		if currentLinkType == proto.LinkType_core {
+			return common.NewBasicError("Shortcut not allowed on core segment", nil)
 		}
-		return common.NewBasicError("Path required",
-			scmp.NewError(scmp.C_Path, scmp.T_P_PathRequired, nil, nil))
 	}
 	// A verify-only Hop Field cannot be used for routing.
 	if rp.hopF.VerifyOnly {
 		return common.NewBasicError("Hop field is VERIFY_ONLY",
 			scmp.NewError(scmp.C_Path, scmp.T_P_NonRoutingHopF, rp.mkInfoPathOffsets(), nil))
 	}
-	// A forward-only Hop Field cannot be used for local delivery.
-	if rp.hopF.ForwardOnly && rp.dstIA == rp.Ctx.Conf.IA {
-		return common.NewBasicError("Hop field is FORWARD_ONLY",
-
-			scmp.NewError(scmp.C_Path, scmp.T_P_DeliveryFwdOnly, rp.mkInfoPathOffsets(), nil))
-	}
 	// Check if Hop Field has expired.
-	hopfExpiry := rp.infoF.Timestamp().Add(
-		time.Duration(rp.hopF.ExpTime) * spath.ExpTimeUnit * time.Second)
+	hopfExpiry := rp.infoF.Timestamp().Add(rp.hopF.ExpTime.ToDuration())
 	if time.Now().After(hopfExpiry) {
 		return common.NewBasicError(
 			"Hop field expired",
@@ -93,11 +87,15 @@ func (rp *RtrPkt) validateLocalIF(ifid *common.IFIDType) error {
 			"ifid", *ifid,
 		)
 	}
+	for _, e := range rp.HBHExt {
+		if e.Type() == common.ExtnOneHopPathType {
+			// Ignore revocations if OneHopExtension is present
+			return nil
+		}
+	}
 	state, ok := ifstate.LoadState(*ifid)
-	if !ok || state.Active || rp.DirTo == rcmn.DirSelf {
-		// Either the interface isn't revoked, or the packet is to this
-		// router, in which case revocations are ignored to allow communication
-		// with the router.
+	if !ok || state.Active {
+		// Interface is not revoked
 		return nil
 	}
 	// Interface is revoked.
@@ -136,9 +134,13 @@ func (rp *RtrPkt) validateLocalIF(ifid *common.IFIDType) error {
 // mkInfoPathOffsets is a helper function to create an scmp.InfoPathOffsets
 // instance from the current packet.
 func (rp *RtrPkt) mkInfoPathOffsets() scmp.Info {
+	var ifid uint16
+	if curr, err := rp.IFCurr(); curr != nil && err == nil {
+		ifid = uint16(*curr)
+	}
 	return &scmp.InfoPathOffsets{
 		InfoF: uint16(rp.CmnHdr.CurrInfoF), HopF: uint16(rp.CmnHdr.CurrHopF),
-		IfID: uint16(*rp.ifCurr), Ingress: rp.DirFrom == rcmn.DirExternal,
+		IfID: ifid, Ingress: rp.DirFrom == rcmn.DirExternal,
 	}
 }
 
@@ -346,33 +348,27 @@ func (rp *RtrPkt) IncPath() (bool, error) {
 		return false, common.NewBasicError("New HopF offset > header length", nil,
 			"max", hdrLen, "actual", hOff)
 	}
-	// Update common header, and packet's InfoF/HopF fields.
 	segChgd := iOff != rp.CmnHdr.InfoFOffBytes()
-	rp.CmnHdr.UpdatePathOffsets(rp.Raw, uint8(iOff/common.LineLen), uint8(hOff/common.LineLen))
-	rp.infoF = infoF
-	rp.hopF = hopF
-	rp.IncrementedPath = true
-	if segChgd {
-		// Extract new ConsDir flag.
-		rp.consDirFlag = nil
-		if _, err = rp.ConsDirFlag(); err != nil {
-			return segChgd, err
-		}
-	}
-	// Extract the next interface ID.
-	rp.ifNext = nil
-	if _, err = rp.IFNext(); err != nil {
-		return segChgd, err
-	}
 	// Check that there's no VERIFY_ONLY fields in the middle of a segment.
 	if vOnly > 0 && !segChgd {
 		return segChgd, common.NewBasicError("VERIFY_ONLY in middle of segment",
 			scmp.NewError(scmp.C_Path, scmp.T_P_BadHopField, rp.mkInfoPathOffsets(), nil))
 	}
 	// Check that the segment didn't change from a down-segment to an up-segment.
-	if origConsDir && !*rp.consDirFlag {
+	if origConsDir && !infoF.ConsDir {
 		return segChgd, common.NewBasicError("Switched from down-segment to up-segment",
 			scmp.NewError(scmp.C_Path, scmp.T_P_BadSegment, rp.mkInfoPathOffsets(), nil))
+	}
+	// Update common header, and packet's InfoF/HopF fields.
+	rp.CmnHdr.UpdatePathOffsets(rp.Raw, uint8(iOff/common.LineLen), uint8(hOff/common.LineLen))
+	rp.infoF = infoF
+	rp.hopF = hopF
+	rp.IncrementedPath = true
+	rp.consDirFlag = &infoF.ConsDir
+	// Extract the next interface ID.
+	rp.ifNext = nil
+	if _, err = rp.IFNext(); err != nil {
+		return segChgd, err
 	}
 	return segChgd, nil
 }
@@ -404,7 +400,8 @@ func (rp *RtrPkt) ConsDirFlag() (*bool, error) {
 	return rp.consDirFlag, nil
 }
 
-// IFCurr retrieves the current interface ID if not already known.
+// IFCurr retrieves the current interface ID from the packet headers/extensions,
+// if not already known.
 func (rp *RtrPkt) IFCurr() (*common.IFIDType, error) {
 	if rp.ifCurr != nil {
 		return rp.ifCurr, nil
@@ -420,7 +417,7 @@ func (rp *RtrPkt) IFCurr() (*common.IFIDType, error) {
 		if rp.hopF != nil {
 			var ingress bool
 			switch rp.DirFrom {
-			case rcmn.DirSelf, rcmn.DirLocal:
+			case rcmn.DirLocal:
 				ingress = !*rp.consDirFlag
 			case rcmn.DirExternal:
 				ingress = *rp.consDirFlag
@@ -434,8 +431,7 @@ func (rp *RtrPkt) IFCurr() (*common.IFIDType, error) {
 			return rp.checkSetCurrIF(&rp.hopF.ConsEgress)
 		}
 	}
-	// Default to the first IfID from Ingress.IfIDs
-	return rp.checkSetCurrIF(&rp.Ingress.IfIDs[0])
+	return nil, nil
 }
 
 // checkSetCurrIF is a helper function that ensures the given interface ID is
@@ -476,7 +472,7 @@ func (rp *RtrPkt) IFNext() (*common.IFIDType, error) {
 // retrival hooks.
 func (rp *RtrPkt) hookIF(consDir bool, hooks []hookIntf) (*common.IFIDType, error) {
 	for _, f := range hooks {
-		ret, intf, err := f(consDir, rp.DirFrom, rp.DirTo)
+		ret, intf, err := f(consDir, rp.DirFrom)
 		switch {
 		case err != nil:
 			return nil, err

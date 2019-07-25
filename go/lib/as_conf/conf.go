@@ -21,15 +21,14 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/util"
 )
 
 type ASConf struct {
-	CertChainVersion int           `yaml:"CertChainVersion"`
-	MasterASKey      util.B64Bytes `yaml:"MasterASKey"`
-	PropagateTime    int           `yaml:"PropagateTime"`
-	RegisterPath     bool          `yaml:"RegisterPath"`
-	RegisterTime     int           `yaml:"RegisterTime"`
+	CertChainVersion int  `yaml:"CertChainVersion"`
+	PathSegmentTTL   int  `yaml:"PathSegmentTTL"`
+	PropagateTime    int  `yaml:"PropagateTime"`
+	RegisterPath     bool `yaml:"RegisterPath"`
+	RegisterTime     int  `yaml:"RegisterTime"`
 }
 
 const CfgName = "as.yml"
@@ -60,6 +59,6 @@ func Parse(data []byte, path string) error {
 
 func (a ASConf) String() string {
 	return fmt.Sprintf(
-		"CertChainVersion:%d MasterASKey:%s PropagateTime:%d RegisterPath:%t RegisterTime:%d",
-		a.CertChainVersion, a.MasterASKey, a.PropagateTime, a.RegisterPath, a.RegisterTime)
+		"CertChainVersion:%d PropagateTime:%d RegisterPath:%t RegisterTime:%d",
+		a.CertChainVersion, a.PropagateTime, a.RegisterPath, a.RegisterTime)
 }

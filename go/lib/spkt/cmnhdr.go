@@ -51,6 +51,11 @@ func CmnHdrFromRaw(b common.RawBytes) (*CmnHdr, error) {
 }
 
 func (c *CmnHdr) Parse(b common.RawBytes) error {
+	// Check for minimum header length
+	if len(b) < CmnHdrLen {
+		return common.NewBasicError("Packet is shorter than the common header length", nil,
+			"min", CmnHdrLen, "actual", len(b))
+	}
 	offset := 0
 	verDstSrc := common.Order.Uint16(b[offset:])
 	c.Ver = uint8(verDstSrc >> 12)
@@ -116,7 +121,7 @@ func (c *CmnHdr) HopFOffBytes() int {
 
 func (c CmnHdr) String() string {
 	return fmt.Sprintf(
-		"Ver:%d Dst:%s Src:%s TotalLen:%dB HdrLen: %dB CurrInfoF:%dB CurrHopF:%dB NextHdr:%s",
+		"Ver:%d Dst:%s Src:%s TotalLen:%dB HdrLen: %d CurrInfoF:%d CurrHopF:%d NextHdr:%s",
 		c.Ver, c.DstType, c.SrcType, c.TotalLen, c.HdrLen, c.CurrInfoF, c.CurrHopF, c.NextHdr,
 	)
 }

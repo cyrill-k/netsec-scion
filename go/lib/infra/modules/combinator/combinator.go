@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,19 +37,21 @@ import (
 )
 
 // Combine constructs paths between src and dst using the supplied
-// segments. All possible paths are returned, sorted according to weight (on
-// equal weight, see pathSolutionList.Less for the tie-breaking algorithm).
+// segments. All possible paths are first computed, and then filtered according
+// to FilterLongPaths. The remaining paths are returned sorted according to
+// weight (on equal weight, see pathSolutionList.Less for the tie-breaking
+// algorithm).
 //
 // If Combine cannot extract a hop field or info field from the segments, it
 // panics.
 func Combine(src, dst addr.IA, ups, cores, downs []*seg.PathSegment) []*Path {
-	paths := NewDAMG(ups, cores, downs).GetPaths(VertexFromIA(src), VertexFromIA(dst))
+	paths := NewDMG(ups, cores, downs).GetPaths(VertexFromIA(src), VertexFromIA(dst))
 
 	var pathSlice []*Path
 	for _, path := range paths {
 		pathSlice = append(pathSlice, path.GetFwdPathMetadata())
 	}
-	return pathSlice
+	return FilterLongPaths(pathSlice)
 }
 
 // InputSegment is a local representation of a path segment that includes the
@@ -69,7 +71,6 @@ type Path struct {
 	Weight     int
 	Mtu        uint16
 	Interfaces []sciond.PathInterface
-	ExpTime    time.Time
 }
 
 func (p *Path) writeTestString(w io.Writer) {
@@ -101,14 +102,34 @@ func (p *Path) aggregateInterfaces() {
 	}
 }
 
-func (p *Path) computeExpTime() {
-	p.ExpTime = time.Unix(1<<63-1, 0)
+func (p *Path) ComputeExpTime() time.Time {
+	minTimestamp := spath.MaxExpirationTime
 	for _, segment := range p.Segments {
-		t := segment.InfoField.Timestamp().Add(time.Duration(segment.ExpTime) * time.Second)
-		if t.Before(p.ExpTime) {
-			p.ExpTime = t
+		expTime := segment.ComputeExpTime()
+		if minTimestamp.After(expTime) {
+			minTimestamp = expTime
 		}
 	}
+	return minTimestamp
+}
+
+func (p *Path) WriteTo(w io.Writer) (int64, error) {
+	var total int64
+	for _, segment := range p.Segments {
+		n, err := segment.InfoField.WriteTo(w)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		for _, hopField := range segment.HopFields {
+			n, err := hopField.WriteTo(w)
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+	}
+	return total, nil
 }
 
 type Segment struct {
@@ -116,7 +137,6 @@ type Segment struct {
 	HopFields  []*HopField
 	Type       proto.PathSegType
 	Interfaces []sciond.PathInterface
-	ExpTime    uint32
 }
 
 // initInfoFieldFrom copies the info field in pathSegment, and sets it as the
@@ -157,6 +177,21 @@ func (segment *Segment) reverse() {
 	}
 }
 
+func (segment *Segment) ComputeExpTime() time.Time {
+	return segment.InfoField.Timestamp().Add(segment.computeHopFieldsTTL())
+}
+
+func (segment *Segment) computeHopFieldsTTL() time.Duration {
+	minTTL := time.Duration(spath.MaxTTL) * time.Second
+	for _, hf := range segment.HopFields {
+		offset := hf.ExpTime.ToDuration()
+		if minTTL > offset {
+			minTTL = offset
+		}
+	}
+	return minTTL
+}
+
 type InfoField struct {
 	*spath.InfoField
 }
@@ -186,4 +221,26 @@ func flagPrint(name string, b bool) string {
 		return "."
 	}
 	return name
+}
+
+// FilterLongPaths returns a new slice containing only those paths that do not
+// go more than twice through interfaces belonging to the same AS (thus
+// filtering paths containing useless loops).
+func FilterLongPaths(paths []*Path) []*Path {
+	var newPaths []*Path
+	for _, path := range paths {
+		long := false
+		iaCounts := make(map[addr.IA]int)
+		for _, iface := range path.Interfaces {
+			iaCounts[iface.ISD_AS()]++
+			if iaCounts[iface.ISD_AS()] > 2 {
+				long = true
+				break
+			}
+		}
+		if !long {
+			newPaths = append(newPaths, path)
+		}
+	}
+	return newPaths
 }

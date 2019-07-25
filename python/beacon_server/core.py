@@ -21,7 +21,7 @@ from collections import defaultdict
 
 # SCION
 from beacon_server.base import BeaconServer, BEACONS_PROPAGATED
-from lib.defines import GEN_CACHE_PATH, PATH_SERVICE
+from lib.defines import GEN_CACHE_PATH
 from lib.errors import SCIONServiceLookupError
 from lib.packet.ctrl_pld import CtrlPayload
 from lib.packet.opaque_field import InfoOpaqueField
@@ -29,7 +29,7 @@ from lib.packet.path_mgmt.base import PathMgmt
 from lib.packet.path_mgmt.seg_recs import PathRecordsReg
 from lib.packet.pcb import PathSegment
 from lib.path_store import PathStore
-from lib.types import PathSegmentType as PST
+from lib.types import PathSegmentType as PST, ServiceType
 from lib.util import SCIONTime
 
 
@@ -40,17 +40,21 @@ class CoreBeaconServer(BeaconServer):
     Starts broadcasting beacons down-stream within an ISD and across ISDs
     towards other core beacon servers.
     """
-    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH, prom_export=None):
+    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH,
+                 prom_export=None, sciond_path=None, filter_isd_loops=False):
         """
         :param str server_id: server identifier.
         :param str conf_dir: configuration directory.
         :param str prom_export: prometheus export address.
+        :param str sciond_path: path to sciond socket
+        :param str filter_isd_loops: filter ISD loops
         """
         super().__init__(server_id, conf_dir, spki_cache_dir=spki_cache_dir,
-                         prom_export=prom_export)
+                         prom_export=prom_export, sciond_path=sciond_path)
         # Sanity check that we should indeed be a core beacon server.
         assert self.topology.is_core_as, "This shouldn't be a local BS!"
         self.core_beacons = defaultdict(self._ps_factory)
+        self.filter_isd_loops = filter_isd_loops
 
     def _ps_factory(self):
         """
@@ -153,7 +157,7 @@ class CoreBeaconServer(BeaconServer):
                 continue
             # Switched to a new ISD
             last_isd = curr_isd
-            if curr_isd in isds:
+            if self.filter_isd_loops and curr_isd in isds:
                 # This ISD has been seen before
                 return False
             isds.add(curr_isd)
@@ -183,12 +187,12 @@ class CoreBeaconServer(BeaconServer):
             if not new_pcb:
                 continue
             try:
-                dst_meta = self.register_core_segment(new_pcb, PATH_SERVICE)
+                dst_meta = self.register_core_segment(new_pcb, ServiceType.PS)
             except SCIONServiceLookupError as e:
                 logging.warning("Unable to send core-segment registration: %s", e)
                 continue
             # Keep the ID of the not-terminated PCB to relate to previously received ones.
-            registered_paths[(str(dst_meta), PATH_SERVICE)].append(pcb.short_id())
+            registered_paths[(str(dst_meta), ServiceType.PS)].append(pcb.short_id())
         self._log_registrations(registered_paths, "core")
 
     def _remove_revoked_pcbs(self, rev_info):

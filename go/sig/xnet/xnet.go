@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,7 +28,6 @@ import (
 )
 
 const (
-	SIGRTable    = 11
 	SIGRPriority = 100
 	SIGTxQlen    = 1000
 )
@@ -65,10 +65,15 @@ Cleanup:
 	return nil, nil, err
 }
 
-func AddRoute(link netlink.Link, dest *net.IPNet) error {
+func AddRoute(rTable int, link netlink.Link, dest *net.IPNet, src net.IP) error {
 	route := &netlink.Route{
-		LinkIndex: link.Attrs().Index, Dst: dest,
-		Priority: SIGRPriority, Table: SIGRTable,
+		LinkIndex: link.Attrs().Index,
+		Dst:       dest,
+		Priority:  SIGRPriority,
+		Table:     rTable,
+	}
+	if len(src) > 0 {
+		route.Src = src
 	}
 	if err := netlink.RouteAdd(route); err != nil {
 		return common.NewBasicError("EgressReader: Unable to add SIG route", err,

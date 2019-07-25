@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,108 +20,99 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"math"
+	"time"
 
 	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/util"
+	"github.com/scionproto/scion/go/lib/scrypto"
 )
-
-type HopField struct {
-	data        common.RawBytes
-	Xover       bool
-	VerifyOnly  bool
-	ForwardOnly bool
-	Recurse     bool
-	ExpTime     uint8
-	ConsIngress common.IFIDType
-	ConsEgress  common.IFIDType
-	Mac         common.RawBytes
-	length      int
-}
 
 const (
-	HopFieldVerifyFlags = 0x4 // Forward-only
-	HopFieldLength      = common.LineLen
-	DefaultHopFExpiry   = 63
-	MacLen              = 3
-	ErrorHopFTooShort   = "HopF too short"
-	ErrorHopFBadMac     = "Bad HopF MAC"
+	HopFieldLength    = common.LineLen
+	DefaultHopFExpiry = ExpTimeType(63)
+	MacLen            = 3
+	ErrorHopFTooShort = "HopF too short"
+	ErrorHopFBadMac   = "Bad HopF MAC"
+	XoverMask         = 0x01
+	VerifyOnlyMask    = 0x02
+	MaxTTL            = 24 * 60 * 60 // One day in seconds
+	ExpTimeUnit       = MaxTTL / 256 // ~5m38s
+	MaxTTLField       = ExpTimeType(math.MaxUint8)
+	macInputLen       = 16
 )
 
-func NewHopField(b common.RawBytes, in common.IFIDType, out common.IFIDType) *HopField {
-	h := &HopField{}
-	h.data = b
-	h.ExpTime = DefaultHopFExpiry
-	h.ConsIngress = in
-	h.ConsEgress = out
-	h.Write()
-	return h
+// Hop Field format:
+//
+//   0                   1                   2                   3
+//   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |r r r r r r V X|    ExpTime    |      ConsIngress      |  ...  |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  | ...ConsEgress |                      MAC                      |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
+// The absolute expiration time in seconds of a Hop Field is calculated as:
+//
+// TS + ( (1 + ExpTime) * ExpTimeUnit ), where TS is the Info Field Timestamp.
+//
+type HopField struct {
+	Xover      bool
+	VerifyOnly bool
+	// ExpTime defines for how long this HopField is valid, expressed as the number
+	// of ExpTimeUnits relative to the PathSegments's InfoField.Timestamp().
+	// A 0 value means the minimum expiration time of ExpTimeUnit.
+	// See ToDuration() for how to convert from ExpTimeUnits to Seconds.
+	ExpTime ExpTimeType
+	// ConsIngress is the interface the PCB entered the AS during path construction.
+	ConsIngress common.IFIDType
+	// ConsEgress is the interface the PCB exited the AS during path construction.
+	ConsEgress common.IFIDType
+	// Mac is the message authentication code of this HF,
+	// see CalcMac() to see how it should be calculated.
+	Mac common.RawBytes
 }
 
 // HopFFromRaw returns a HopField object from the raw content in b.
-//
-// The new HopField object takes ownership of the first HopFieldLength bytes in
-// b. Changing fields in the new object and calling Write will mutate the
-// initial bytes in b.
 func HopFFromRaw(b []byte) (*HopField, error) {
 	if len(b) < HopFieldLength {
 		return nil, common.NewBasicError(ErrorHopFTooShort, nil,
 			"min", HopFieldLength, "actual", len(b))
 	}
 	h := &HopField{}
-	h.data = b[:HopFieldLength]
-	flags := h.data[0]
-	h.Xover = flags&0x1 != 0
-	h.VerifyOnly = flags&0x2 != 0
-	h.ForwardOnly = flags&0x4 != 0
-	h.Recurse = flags&0x8 != 0
-	offset := 1
-	h.ExpTime = h.data[offset]
-	offset += 1
+	flags := b[0]
+	h.Xover = flags&XoverMask != 0
+	h.VerifyOnly = flags&VerifyOnlyMask != 0
+	h.ExpTime = ExpTimeType(b[1])
 	// Interface IDs are 12b each, encoded into 3B
-	h.ConsIngress = common.IFIDType(int(h.data[offset])<<4 | int(h.data[offset+1])>>4)
-	h.ConsEgress = common.IFIDType((int(h.data[offset+1])&0xF)<<8 | int(h.data[offset+2]))
-	offset += 3
-	h.Mac = h.data[offset:]
-	h.length = common.LineLen
+	ifids := common.Order.Uint32(b[1:5])
+	h.ConsIngress = common.IFIDType((ifids >> 12) & 0xFFF)
+	h.ConsEgress = common.IFIDType(ifids & 0xFFF)
+	h.Mac = make([]byte, MacLen)
+	copy(h.Mac, b[5:HopFieldLength])
 	return h, nil
 }
 
-// Len returns the length (in bytes)
-func (h *HopField) Len() int {
-	return h.length
-}
-
-func (h *HopField) Write() {
+func (h *HopField) Write(b common.RawBytes) {
 	var flags uint8
 	if h.Xover {
-		flags |= 0x1
+		flags |= XoverMask
 	}
 	if h.VerifyOnly {
-		flags |= 0x2
+		flags |= VerifyOnlyMask
 	}
-	if h.ForwardOnly {
-		flags |= 0x4
-	}
-	if h.Recurse {
-		flags |= 0x8
-	}
-	h.data[0] = flags
-	h.data[1] = h.ExpTime
-	// Interface IDs are 12b each, encoded into 3B
-	h.data[2] = byte(h.ConsIngress >> 4)
-	h.data[3] = byte((h.ConsIngress&0x0F)<<4 | h.ConsEgress>>8)
-	h.data[4] = byte(h.ConsEgress & 0xFF)
-	copy(h.data[5:], h.Mac)
+	b[0] = flags
+	common.Order.PutUint32(b[1:5], h.expTimeIfIdsPack())
+	copy(b[5:], h.Mac)
 }
 
 func (h *HopField) String() string {
-	return fmt.Sprintf("ConsIngress: %v ConsEgress: %v ExpTime: %v Xover: %v VerifyOnly: %v "+
-		"ForwardOnly: %v Mac: %v",
-		h.ConsIngress, h.ConsEgress, h.ExpTime, h.Xover, h.VerifyOnly, h.ForwardOnly, h.Mac)
+	return fmt.Sprintf(
+		"ConsIngress: %v ConsEgress: %v ExpTime: %v Xover: %v VerifyOnly: %v Mac: %v",
+		h.ConsIngress, h.ConsEgress, h.ExpTime, h.Xover, h.VerifyOnly, h.Mac)
 }
 
-func (h *HopField) Verify(mac hash.Hash, tsInt uint32, prev common.RawBytes) error {
-	if mac, err := h.CalcMac(mac, tsInt, prev); err != nil {
+func (h *HopField) Verify(macH hash.Hash, tsInt uint32, prev common.RawBytes) error {
+	if mac, err := h.CalcMac(macH, tsInt, prev); err != nil {
 		return err
 	} else if !bytes.Equal(h.Mac, mac) {
 		return common.NewBasicError(ErrorHopFBadMac, nil, "expected", h.Mac, "actual", mac)
@@ -128,21 +120,57 @@ func (h *HopField) Verify(mac hash.Hash, tsInt uint32, prev common.RawBytes) err
 	return nil
 }
 
-// CalcMac calculates the MAC of a Hop Field and its preceeding Hop Field, if any.
+// CalcMac calculates the MAC of a HopField and its preceding HopField, if any.
+// prev does not contain flags byte.
+//
+// MAC input block format:
+//
+//   0                   1                   2                   3
+//   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |                           Timestamp                           |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |       0       |    ExpTime    |      ConsIngress      |  ...  |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  | ...ConsEgress |                                               |
+//  +-+-+-+-+-+-+-+-+                                               |
+//  |                           PrevHopF                            |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
 func (h *HopField) CalcMac(mac hash.Hash, tsInt uint32,
 	prev common.RawBytes) (common.RawBytes, error) {
+
 	all := make(common.RawBytes, macInputLen)
 	common.Order.PutUint32(all, tsInt)
-	all[4] = h.data[0] & HopFieldVerifyFlags
-	copy(all[5:], h.data[1:5])
+	all[4] = 0 // Ignore flags
+	common.Order.PutUint32(all[5:], h.expTimeIfIdsPack())
 	copy(all[9:], prev)
-	tag, err := util.Mac(mac, all)
+	tag, err := scrypto.Mac(mac, all)
 	return tag[:MacLen], err
 }
 
 // WriteTo implements the io.WriterTo interface.
 func (h *HopField) WriteTo(w io.Writer) (int64, error) {
-	h.Write()
-	n, err := w.Write(h.data)
+	b := make(common.RawBytes, HopFieldLength)
+	h.Write(b)
+	n, err := w.Write(b)
 	return int64(n), err
+}
+
+func (h *HopField) expTimeIfIdsPack() uint32 {
+	// Interface IDs are 12 bits each, encoded into 3 Bytes.
+	return uint32(h.ExpTime)<<24 | uint32(h.ConsIngress&0xFFF)<<12 | uint32(h.ConsEgress&0xFFF)
+}
+
+func (h *HopField) Eq(o *HopField) bool {
+	return h.Xover == o.Xover && h.VerifyOnly == o.VerifyOnly && h.ExpTime == o.ExpTime &&
+		h.ConsIngress == o.ConsIngress && h.ConsEgress == o.ConsEgress && bytes.Equal(h.Mac, o.Mac)
+}
+
+type ExpTimeType uint8
+
+// ToDuration calculates the relative expiration time in seconds.
+// Note that for a 0 value ExpTime, the minimal duration is ExpTimeUnit.
+func (e ExpTimeType) ToDuration() time.Duration {
+	return (time.Duration(e) + 1) * time.Duration(ExpTimeUnit) * time.Second
 }

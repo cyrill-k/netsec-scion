@@ -1,4 +1,5 @@
 # Copyright 2014 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,17 +20,13 @@
 import logging
 
 # SCION
-from lib.defines import (
-    BEACON_SERVICE,
-    CERTIFICATE_SERVICE,
-    PATH_SERVICE,
-    ROUTER_SERVICE,
-    SIBRA_SERVICE,
-)
 from lib.errors import SCIONKeyError
 from lib.packet.host_addr import haddr_parse_interface
 from lib.packet.scion_addr import ISD_AS
-from lib.types import LinkType
+from lib.types import (
+    LinkType,
+    ServiceType
+)
 from lib.util import load_yaml_file
 
 
@@ -41,32 +38,35 @@ class Element(object):
     :ivar HostAddrBase addr: Host address of a server or border router.
     :ivar str name: element name or id
     """
-    def __init__(self, public=None, bind=None, name=None):
+    def __init__(self, addrs=None, name=None):
         """
-        :param dict public:
-            ((addr_type, address), port) of the element's public address.
-            (i.e. the address visible to other network elements).
-        :param dict bind:
-            ((addr_type, address), port) of the element's bind address, if any
-            (i.e. the address the element uses to identify itself to the local
-            operating system, if it differs from the public address due to NAT).
+        :param dict addrs:
+            contains the public and bind addresses. Only one public/bind addresses pair
+            is chosen from all the available addresses in the map.
         :param str name: element name or id
         """
+        public, bind = self._get_pub_bind(addrs)
         self.public = self._parse_addrs(public)
         self.bind = self._parse_addrs(bind)
         self.name = None
         if name is not None:
             self.name = str(name)
 
+    def _get_pub_bind(self, addrs):
+        if addrs is None:
+            return None, None
+        pub_bind = addrs.get('IPv6')
+        if pub_bind is not None:
+            return pub_bind['Public'], pub_bind.get('Bind')
+        pub_bind = addrs.get('IPv4')
+        if pub_bind is not None:
+            return pub_bind['Public'], pub_bind.get('Bind')
+        return None, None
+
     def _parse_addrs(self, value):
         if not value:
-            return []
-        addrs = []
-        if not isinstance(value, (list, tuple)):
-            value = [value]
-        for val in value:
-            addrs.append((haddr_parse_interface(val['Addr']), val['L4Port']))
-        return addrs
+            return None
+        return (haddr_parse_interface(value['Addr']), value['L4Port'])
 
 
 class ServerElement(Element):
@@ -76,12 +76,55 @@ class ServerElement(Element):
         :param dict server_dict: contains information about a particular server.
         :param str name: server element name or id
         """
-        super().__init__(server_dict['Public'], server_dict.get('Bind'), name)
+        super().__init__(server_dict['Addrs'], name)
 
 
-class InterfaceElement(Element):
+class RouterAddrElement(object):
     """
-    The InterfaceElement class represents one of the interfaces of an border
+    The RouterAddrElement class is the base class for elements specified in the
+    Border router topology section.
+
+    :ivar HostAddrBase addr: Host address of a border router.
+    :ivar str name: element name or id
+    """
+    def __init__(self, addrs=None, name=None):
+        """
+        :param dict public:
+            ((addr_type, address), overlay_port) of the element's public address.
+            (i.e. the address visible to other network elements).
+        :param dict bind:
+            (addr_type, address) of the element's bind address, if any
+            (i.e. the address the element uses to identify itself to the local
+            operating system, if it differs from the public address due to NAT).
+        :param str name: element name or id
+        """
+        public, bind = self._get_pub_bind(addrs)
+        self.public = self._parse_addrs(public)
+        self.bind = self._parse_addrs(bind)
+        self.name = None
+        if name is not None:
+            self.name = str(name)
+
+    def _get_pub_bind(self, addrs):
+        if addrs is None:
+            return None, None
+        pub_bind = addrs.get('IPv6')
+        if pub_bind is not None:
+            return pub_bind['PublicOverlay'], pub_bind.get('BindOverlay')
+        pub_bind = addrs.get('IPv4')
+        if pub_bind is not None:
+            return pub_bind['PublicOverlay'], pub_bind.get('BindOverlay')
+        return None, None
+
+    def _parse_addrs(self, value):
+        if not value:
+            return None
+        return (haddr_parse_interface(value['Addr']), value['OverlayPort'])
+
+
+class InterfaceElement(RouterAddrElement):
+    """
+    The InterfaceElement class represents one of the interfaces of a border
     router.
 
     :ivar int if_id: the interface ID.
@@ -97,15 +140,29 @@ class InterfaceElement(Element):
         :param dict interface_dict: contains information about the interface.
         """
         self.if_id = int(if_id)
-        self.addr_idx = interface_dict['InternalAddrIdx']
         self.isd_as = ISD_AS(interface_dict['ISD_AS'])
         self.link_type = interface_dict['LinkTo'].lower()
         self.bandwidth = interface_dict['Bandwidth']
         self.mtu = interface_dict['MTU']
-        self.overlay = interface_dict['Overlay']
+        self.overlay = interface_dict.get('Overlay')
         self.to_if_id = 0  # Filled in later by IFID packets
-        self.remote = self._parse_addrs(interface_dict['Remote'])
-        super().__init__(interface_dict['Public'], interface_dict.get('Bind'), name)
+        self.remote = self._parse_addrs(interface_dict.get('RemoteOverlay'))
+        super().__init__(self._new_addrs(interface_dict), name)
+
+    def _new_addrs(self, interface_dict):
+        addrs = {}
+        if not self.overlay:
+            return None
+        if 'IPv4' in self.overlay:
+            addrType = 'IPv4'
+        else:  # Assume IPv6
+            addrType = 'IPv6'
+        addrs[addrType] = {}
+        addrs[addrType]['PublicOverlay'] = interface_dict['PublicOverlay']
+        bind = interface_dict.get('BindOverlay')
+        if bind is not None:
+            addrs[addrType]['BindOverlay'] = bind
+        return addrs
 
     def __lt__(self, other):  # pragma: no cover
         return self.if_id < other.if_id
@@ -121,9 +178,8 @@ class RouterElement(object):
         :param str name: router element name or id
         """
         self.name = name
-        self.int_addrs = []
-        for addrs in router_dict['InternalAddrs']:
-            self.int_addrs.append(Element(public=addrs["Public"], bind=addrs.get("Bind")))
+        self.ctrl_addrs = Element(router_dict['CtrlAddr'])
+        self.int_addrs = RouterAddrElement(router_dict['InternalAddrs'])
         self.interfaces = {}
         for if_id, intf in router_dict['Interfaces'].items():
             if_id = int(if_id)
@@ -143,6 +199,8 @@ class Topology(object):
     :ivar list beacon_servers: beacons servers in the AS.
     :ivar list certificate_servers: certificate servers in the AS.
     :ivar list path_servers: path servers in the AS.
+    :ivar list sigs: SIGs in the as.
+    :ivar list discovery_servers: discovery servers in the AS.
     :ivar list border_routers: border routers in the AS.
     :ivar list parent_interfaces: BR interfaces linking to upstream ASes.
     :ivar list child_interfaces: BR interfaces linking to downstream ASes.
@@ -158,6 +216,8 @@ class Topology(object):
         self.certificate_servers = []
         self.path_servers = []
         self.sibra_servers = []
+        self.sigs = []
+        self.discovery_servers = []
         self.border_routers = []
         self.parent_interfaces = []
         self.child_interfaces = []
@@ -207,6 +267,8 @@ class Topology(object):
             ("CertificateService", self.certificate_servers),
             ("PathService", self.path_servers),
             ("SibraService", self.sibra_servers),
+            ("SIG", self.sigs),
+            ("DiscoveryService", self.discovery_servers),
         ):
             for k, v in topology.get(type_, {}).items():
                 list_.append(ServerElement(v, k))
@@ -246,11 +308,12 @@ class Topology(object):
 
     def get_own_config(self, server_type, server_id):
         type_map = {
-            BEACON_SERVICE: self.beacon_servers,
-            CERTIFICATE_SERVICE: self.certificate_servers,
-            PATH_SERVICE: self.path_servers,
-            ROUTER_SERVICE: self.border_routers,
-            SIBRA_SERVICE: self.sibra_servers,
+            ServiceType.BS: self.beacon_servers,
+            ServiceType.CS: self.certificate_servers,
+            ServiceType.PS: self.path_servers,
+            ServiceType.SIBRA: self.sibra_servers,
+            ServiceType.SIG: self.sigs,
+            ServiceType.DS: self.discovery_servers,
         }
         try:
             target = type_map[server_type]

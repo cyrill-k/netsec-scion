@@ -3,16 +3,19 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -23,7 +26,6 @@
 #include <uthash.h>
 
 #include "scion/scion.h"
-#include "tcp/middleware.h"
 
 #define APP_BUFSIZE 32
 #define DATA_BUFSIZE 65535
@@ -42,8 +44,10 @@
 FilterSocket *filter_socket = NULL;
 #endif
 
+#ifndef ZLOG_DEBUG
 #undef zlog_debug
 #define zlog_debug(...)
+#endif
 
 #define CMSG_CTRL_SIZE (CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(uint32_t)))
 #define DSTADDR(x) (((struct in_pktinfo *)CMSG_DATA(x))->ipi_addr)
@@ -121,7 +125,8 @@ static chk_input *chk_udp_input;
 static zlog_category_t *zc;
 
 void handle_signal(int signal);
-int init_tcpmw();
+void parse_cmdline(int argc, char **argv);
+void unlink_socket();
 int run();
 
 int create_sockets();
@@ -133,13 +138,13 @@ void handle_app();
 void register_udp(uint8_t *buf, int len, int sock);
 Entry * parse_request(uint8_t *buf, int len, int proto, int sock);
 int add_bind_addr(Entry *e, uint8_t *buf, isdas_t isd_as, int offset);
-int find_available_port(Entry *list, L4Key *key);
+int find_available_udp_port(L4Key *key);
+int find_available_bind_port(L4Key *key);
 void reply(int sock, int port);
 static inline uint16_t get_next_port();
 
 void handle_data(int v6);
 void count_drops(int v6, uint32_t new_drops);
-void deliver_tcp(uint8_t *buf, int len, HostAddr *from);
 void deliver_udp(uint8_t *buf, int len, HostAddr *from, HostAddr *dst);
 void deliver_udp_svc(uint8_t *buf, int len, HostAddr *from, HostAddr *dst);
 
@@ -161,7 +166,6 @@ char socket_path[UNIX_PATH_MAX];
 
 #define MAX_NUMBER_PINGS MAX_SOCKETS
 PingEntry *ping_list = NULL;
-
 int main(int argc, char **argv)
 {
     signal(SIGTERM, handle_signal);
@@ -177,7 +181,7 @@ int main(int argc, char **argv)
     if (!zlog_cfg)
         zlog_cfg = "c/dispatcher/dispatcher.conf";
     if (zlog_init(zlog_cfg) < 0) {
-        fprintf(stderr, "failed to init zlog (cfg: %s)\n", zlog_cfg);
+        fprintf(stderr, "failed to init zlog (cfg: %s): %s\n", zlog_cfg, strerror(errno));
         return -1;
     }
     zc = zlog_get_category("dispatcher");
@@ -186,28 +190,14 @@ int main(int argc, char **argv)
         zlog_fini();
         return -1;
     }
+    parse_cmdline(argc, argv);
 
-    /* TCPMW uses many open files, set limit as high as possible */
-    struct rlimit rlim;
-    if (getrlimit(RLIMIT_NOFILE, &rlim) < 0) {
-        zlog_fatal(zc, "getrlimit(): %s", strerror(errno));
-        return -1;
-    }
-    zlog_debug(zc, "Changing RLIMIT_NOFILE %lu -> %lu", rlim.rlim_cur, rlim.rlim_max);
-    rlim.rlim_cur = rlim.rlim_max;
-    if (setrlimit(RLIMIT_NOFILE, &rlim) < 0) {
-        zlog_fatal(zc, "setrlimit(): %s", strerror(errno));
-        return -1;
-    }
     /* Allocate for later use */
     chk_udp_input = mk_chk_input(UDP_CHK_INPUT_SIZE);
 
     zlog_info(zc, "dispatcher with zlog starting up");
 
     if (create_sockets() < 0)
-        return -1;
-
-    if (init_tcpmw() < 0)
         return -1;
 
     res = run();
@@ -219,6 +209,58 @@ int main(int argc, char **argv)
 
     zlog_fini();
     return res;
+}
+
+void parse_cmdline(int argc, char **argv) {
+    int c;
+    bool delete_sock=false;
+
+    while (1) {
+        int option_index = 0;
+        const static struct option long_options[] = {
+            {"help",        no_argument, NULL, 'h' },
+            {"delete-sock", no_argument, NULL, 'd' },
+            {NULL,          0,           NULL, 0   }
+        };
+        c = getopt_long(argc, argv, "h", long_options, &option_index);
+        if (c == -1) {
+            break;
+        }
+
+        switch(c) {
+        case 'h':
+            fprintf(stderr, "Usage: %s [flags]\n    -h,--help: this message\n"
+                    "    --delete-sock: delete Unix domain socket on start\n",
+                    argv[0]);
+            exit(1);
+        case 'd':
+            delete_sock = true;
+            break;
+        default:
+            fprintf(stderr, "Unknown option '%s'\n", argv[option_index+1]);
+            exit(2);
+        }
+    }
+    if (delete_sock) {
+       unlink_socket();
+    }
+}
+
+void unlink_socket() {
+    char *sockpath = NULL;
+    asprintf(&sockpath, "%s/default.sock", DISPATCHER_DIR);
+    errno = 0;
+    if (unlink(sockpath)) {
+        if (errno == ENOENT) {
+            zlog_debug(zc, "'%s' does not exist, ignoring --delete-sock flag.", sockpath);
+            free(sockpath);
+            return;
+        }
+        zlog_error(zc, "could not unlink '%s': %s", sockpath, strerror(errno));
+        exit(2);
+    }
+    zlog_info(zc, "successfully deleted '%s'", sockpath);
+    free(sockpath);
 }
 
 void handle_signal(int sig)
@@ -353,10 +395,13 @@ int bind_app_socket()
             return -1;
         }
     }
+    /* Use 0666 for socket permissions */
+    mode_t old_mask = umask(0111);
     if (bind(app_socket, (struct sockaddr *)&su, sizeof(su)) < 0) {
         zlog_fatal(zc, "failed to bind app socket to %s", su.sun_path);
         return -1;
     }
+    umask(old_mask);
     if (listen(app_socket, MAX_BACKLOG) < 0) {
         zlog_fatal(zc, "failed to listen on app socket");
         return -1;
@@ -397,18 +442,6 @@ int bind_data_sockets()
             return -1;
         }
         zlog_info(zc, "data v6 socket bound to %s:%d", str, ntohs(sin6->sin6_port));
-    }
-    return 0;
-}
-
-int init_tcpmw()
-{
-    pthread_t tid;
-    tcp_scion_output = &send_data;
-    zc_tcp = zc;
-    if (pthread_create(&tid, NULL, &tcpmw_main_thread, NULL)) {
-        zlog_fatal(zc, "pthread_create(): %s", strerror(errno));
-        return -1;
     }
     return 0;
 }
@@ -525,9 +558,15 @@ void register_udp(uint8_t *buf, int len, int sock)
 {
     zlog_info(zc, "UDP registration request");
     Entry *e = parse_request(buf, len, L4_UDP, sock);
+    if (memcmp(&e->l4_key, &e->bind_key, sizeof(L4Key)) == 0) {
+        zlog_error(zc, "Not supported same public and bind address");
+        reply(sock, 0);
+        cleanup_socket(sock, num_sockets - 1, EINVAL);
+        return;
+    }
     if (!e)
         return;
-    if (find_available_port(udp_port_list, &e->l4_key) < 0) {
+    if (find_available_udp_port(&e->l4_key) < 0) {
         reply(sock, 0);
         cleanup_socket(sock, num_sockets - 1, EINVAL);
         return;
@@ -537,7 +576,7 @@ void register_udp(uint8_t *buf, int len, int sock)
 
     /* Register bind address info if the app has a bind address */
     if (IS_BIND_SOCKET(*buf)) {
-        if (find_available_port(bind_udp_port_list, &e->bind_key) < 0) {
+        if (find_available_bind_port(&e->bind_key) < 0) {
             reply(sock, 0);
             cleanup_socket(sock, num_sockets - 1, EINVAL);
             return;
@@ -555,8 +594,10 @@ Entry * parse_request(uint8_t *buf, int len, int proto, int sock)
     isdas_t isd_as = be64toh(*(isdas_t *)(buf + 2));
     uint16_t port = ntohs(*(uint16_t *)(buf + 2 + ISD_AS_LEN));
     int common = 2 + ISD_AS_LEN + 2 + 1; // start of (protocol/addrtype)-dependent data
+    char isd_as_str[MAX_ISD_AS_STR];
 
-    zlog_info(zc, "registration for isd_as %d-%" PRId64, ISD(isd_as), AS(isd_as));
+    format_isd_as(isd_as_str, MAX_ISD_AS_STR, isd_as);
+    zlog_info(zc, "registration for isd_as %s", isd_as_str);
 
     Entry *e = (Entry *)malloc(sizeof(Entry));
     if (!e) {
@@ -636,13 +677,14 @@ Entry * parse_request(uint8_t *buf, int len, int proto, int sock)
                 se->bind_key.isd_as = isd_as;
 
                 HASH_ADD(bindhh, bind_svc_list, bind_key, sizeof(SVCKey), se);
-                zlog_info(zc, "Adding Bind SVC entry. SVC:%d ISD_AS:%d-%" PRId64 " Host:%s",
-                    se->bind_key.addr, ISD(se->bind_key.isd_as), AS(se->bind_key.isd_as),
-                    addr_to_str(se->bind_key.host, type, NULL));
+                format_isd_as(isd_as_str, MAX_ISD_AS_STR, se->bind_key.isd_as);
+                zlog_info(zc, "Adding Bind SVC entry. SVC:%d ISD_AS:%s Host:%s",
+                    se->bind_key.addr, isd_as_str, addr_to_str(se->bind_key.host, type, NULL));
             }
             HASH_ADD(hh, svc_list, key, sizeof(SVCKey), se);
-            zlog_info(zc, "Adding SVC entry. SVC:%d ISD_AS:%d-%" PRId64 " Host:%s",
-                    se->key.addr, ISD(se->key.isd_as), AS(se->key.isd_as), addr_to_str(se->key.host, type, NULL));
+            format_isd_as(isd_as_str, MAX_ISD_AS_STR, se->key.isd_as);
+            zlog_info(zc, "Adding SVC entry. SVC:%d ISD_AS:%s Host:%s",
+                    se->key.addr, isd_as_str, addr_to_str(se->key.host, type, NULL));
         }
         e->se = se;
     }
@@ -667,7 +709,7 @@ int add_bind_addr(Entry *e, uint8_t *buf, isdas_t isd_as, int offset)
     return offset + port_len + type_len + b_addr_len;
 }
 
-int find_available_port(Entry *list, L4Key *key)
+int find_available_port(bool bind, L4Key *key)
 {
     Entry *old;
     int requested = 1;
@@ -678,7 +720,11 @@ int find_available_port(Entry *list, L4Key *key)
     int start_port = key->port;
     while (1) {
         // Find an available port number between 1025 and 65535.
-        HASH_FIND(hh, list, key, sizeof(L4Key), old);
+        if (bind) {
+            HASH_FIND(bindhh, bind_udp_port_list, key, sizeof(L4Key), old);
+        } else {
+            HASH_FIND(hh, udp_port_list, key, sizeof(L4Key), old);
+        }
         if (old) {
             if (requested) {
                 // If app requested unavailable port number, reply with failure message
@@ -697,6 +743,16 @@ int find_available_port(Entry *list, L4Key *key)
         }
     }
     return 0;
+}
+
+inline int find_available_udp_port(L4Key *key)
+{
+    return find_available_port(false, key);
+}
+
+inline int find_available_bind_port(L4Key *key)
+{
+    return find_available_port(true, key);
 }
 
 void reply(int sock, int port)
@@ -805,9 +861,6 @@ void handle_data(int v6)
         case L4_UDP:
             deliver_udp(buf, len, &from, &dst);
             break;
-        case L4_TCP:
-            deliver_tcp(buf, len, &from);
-            break;
         default:
             zlog_error(zc, "delivery: unsupported L4 protocol %d", l4);
             break;
@@ -837,7 +890,7 @@ void count_drops(int v6, uint32_t new_drops) {
     time_t now = time(NULL);
     // Only report if it's a new second, and packets have been dropped since the last report.
     if (now != last_report && drop_count > 0) {
-        zlog_warn(zc, "Dropped UDP packets: %lu", drop_count);
+        zlog_warn(zc, "Dropped UDP packets: %" PRIu64, drop_count);
         last_report = now;
         drop_count = 0;
     }
@@ -875,9 +928,10 @@ void deliver_udp(uint8_t *buf, int len, HostAddr *from, HostAddr *dst)
         /* Find dst info from the bind address list if the lookup fails with the public address list*/
         HASH_FIND(bindhh, bind_udp_port_list, &key, sizeof(key), e);
         if (!e) {
-            zlog_warn(zc, "entry for (%d-%" PRId64 "):%s:%d not found",
-                    ISD(key.isd_as), AS(key.isd_as),
-                    addr_to_str(key.host, DST_TYPE(sch), NULL), key.port);
+            char isd_as_str[MAX_ISD_AS_STR];
+            format_isd_as(isd_as_str, MAX_ISD_AS_STR, key.isd_as);
+            zlog_warn(zc, "entry for (%s):%s:%d not found",
+                    isd_as_str, addr_to_str(key.host, DST_TYPE(sch), NULL), key.port);
             return;
         }
     }
@@ -888,6 +942,8 @@ void deliver_udp_svc(uint8_t *buf, int len, HostAddr *from, HostAddr *dst) {
     SVCKey svc_key;
     memset(&svc_key, 0, sizeof(SVCKey));
     uint16_t addr = ntohs(*(uint16_t *)get_dst_addr(buf));
+    char isd_as_str[MAX_ISD_AS_STR];
+
     svc_key.addr = addr & ~SVC_MULTICAST;  // Mask off top multicast bit
     svc_key.isd_as = get_dst_isd_as(buf);
     memcpy(svc_key.host, dst->addr, get_addr_len(dst->addr_type));
@@ -898,16 +954,17 @@ void deliver_udp_svc(uint8_t *buf, int len, HostAddr *from, HostAddr *dst) {
         /* Find dst info from the bind address list if the lookup fails with the public address list*/
         HASH_FIND(bindhh, bind_svc_list, &svc_key, sizeof(SVCKey), se);
         if (!se) {
-            zlog_warn(zc, "Entry not found: ISD-AS: %d-%" PRId64 " SVC: %02x IP: %s",
-                    ISD(svc_key.isd_as), AS(svc_key.isd_as), svc_key.addr,
+            format_isd_as(isd_as_str, MAX_ISD_AS_STR, svc_key.isd_as);
+            zlog_warn(zc, "Entry not found: ISD-AS: %s SVC: %02x IP: %s",
+                    isd_as_str, svc_key.addr,
                     addr_to_str(dst->addr, dst->addr_type, NULL));
             return;
         }
     }
-    //char dststr[MAX_HOST_ADDR_STR];
-    //char svcstr[MAX_HOST_ADDR_STR];
-    zlog_debug(zc, "deliver UDP packet to (%d-%" PRId64 "):%s SVC:%s",
-            ISD(svc_key.isd_as), AS(svc_key.isd_as),
+    char dststr[MAX_HOST_ADDR_STR] __attribute__ ((unused));
+    char svcstr[MAX_HOST_ADDR_STR] __attribute__ ((unused));
+    zlog_debug(zc, "deliver UDP packet to (%s):%s SVC:%s",
+            format_isd_as(isd_as_str, MAX_ISD_AS_STR, svc_key.isd_as),
             addr_to_str(dst->addr, dst->addr_type, dststr),
             addr_to_str(get_dst_addr(buf), ADDR_SVC_TYPE, svcstr));
     if (!(addr & SVC_MULTICAST)) {  // Anycast SVC address
@@ -919,16 +976,6 @@ void deliver_udp_svc(uint8_t *buf, int len, HostAddr *from, HostAddr *dst) {
     for (i = 0; i < se->count; i++) {
         deliver_data(se->sockets[i], from, buf, len);
     }
-}
-
-void deliver_tcp(uint8_t *buf, int len, HostAddr *from)
-{
-    /* Allocate buffer for LWIP's processing. */
-    struct pbuf *p = pbuf_alloc(PBUF_RAW, sizeof(HostAddr) + len, PBUF_RAM);
-    memcpy(p->payload, from, sizeof(HostAddr));
-    memcpy(p->payload + sizeof(HostAddr), buf, len);
-    /* Put [from (HostAddr) || raw_spkt] to the TCP queue. */
-    tcpip_input(p, (struct netif *)NULL);
 }
 
 void process_scmp(uint8_t *buf, SCMPL4Header *scmp, int len, HostAddr *from)
@@ -987,11 +1034,11 @@ void deliver_scmp_reply(uint8_t *buf, SCMPL4Header *scmp, int len, HostAddr *fro
     HASH_FIND(hh, ping_list, &id, sizeof(id), e);
     if (e != NULL) {
         zlog_debug(zc, "SCMP %s reply (%" PRIx64 ") entry found",
-                scmp_ct_to_str(strbuf, scmp->class_, scmp->type), be64toh(id));
+                scmp_ct_to_str(strbuf, ntohs(scmp->class_), ntohs(scmp->type)), be64toh(id));
         deliver_data(e->sock, from, buf, len);
     } else {
         zlog_warn(zc, "SCMP %s reply (%" PRIx64 ") entry not found",
-                scmp_ct_to_str(strbuf, scmp->class_, scmp->type), be64toh(id));
+                scmp_ct_to_str(strbuf, ntohs(scmp->class_), ntohs(scmp->type)), be64toh(id));
     }
     free(pld);
 }
@@ -1010,32 +1057,52 @@ void deliver_scmp(uint8_t *buf, SCMPL4Header *scmp, int len, HostAddr *from)
         goto cleanup;
     }
 
+    int sock;
     Entry *e;
-    L4Key key;
-    memset(&key, 0, sizeof(key));
-    key.isd_as = be64toh(*(isdas_t *)(pld->addr + ISD_AS_LEN));
-    memcpy(key.host, get_src_addr((uint8_t * )pld->cmnhdr), get_src_len((uint8_t * )pld->cmnhdr));
+    L4Key key = { 0 };
+    char isd_as_str[MAX_ISD_AS_STR];
+    PingEntry *pe;
+    uint64_t id;
+    char strbuf[MAX_SCMP_CLASS_TYPE_STR] = { 0 };
     switch (pld->meta->l4_proto) {
-        case L4_UDP:
-            /* Find src info in payload */
-            key.port = ntohs(*(uint16_t *)(pld->l4hdr));
-            HASH_FIND(hh, udp_port_list, &key, sizeof(key), e);
-            if (!e) {
-                zlog_info(zc, "SCMP entry for %d-%" PRId64 " %s:%d not found",
-                        ISD(key.isd_as), AS(key.isd_as),
-                        addr_to_str(key.host, DST_TYPE((SCIONCommonHeader *)buf), NULL), key.port);
-                goto cleanup;
-            }
-            zlog_debug(zc, "SCMP entry %d-%" PRId64 " for %s:%d found",
-                    ISD(key.isd_as), AS(key.isd_as),
+    case L4_UDP:
+        key.isd_as = be64toh(*(isdas_t *)(pld->addr + ISD_AS_LEN));
+        memcpy(key.host, get_src_addr((uint8_t * )pld->cmnhdr),
+                get_src_len((uint8_t * )pld->cmnhdr));
+        /* Find src info in payload */
+        key.port = ntohs(*(uint16_t *)(pld->l4hdr));
+        HASH_FIND(hh, udp_port_list, &key, sizeof(key), e);
+        if (!e) {
+            format_isd_as(isd_as_str, MAX_ISD_AS_STR, key.isd_as);
+            zlog_warn(zc, "SCMP entry for %s %s:%d not found", isd_as_str,
                     addr_to_str(key.host, DST_TYPE((SCIONCommonHeader *)buf), NULL), key.port);
-            break;
-        default:
-            zlog_error(zc, "SCMP not supported for protocol %d", pld->meta->l4_proto);
             goto cleanup;
+        }
+        zlog_debug(zc, "SCMP entry for %s %s:%d found",
+                format_isd_as(isd_as_str, MAX_ISD_AS_STR, key.isd_as),
+                addr_to_str(key.host, DST_TYPE((SCIONCommonHeader *)buf), NULL), key.port);
+        sock = e->sock;
+        break;
+    case L4_SCMP:
+        // XXX This is a special case where the L4 header quote also contains the Meta and Info
+        // fields of the original SCMP packet, where the ID is always the first 8B of the Info.
+        id = *((uint64_t *)(pld->l4hdr + sizeof(SCMPL4Header) + sizeof(SCMPMetaHeader)));
+        HASH_FIND(hh, ping_list, &id, sizeof(id), pe);
+        if (!pe) {
+            zlog_warn(zc, "SCMP %s reply (%" PRIx64 ") entry not found",
+                    scmp_ct_to_str(strbuf, ntohs(scmp->class_), ntohs(scmp->type)), be64toh(id));
+            goto cleanup;
+        }
+        zlog_debug(zc, "SCMP %s reply (%" PRIx64 ") entry found",
+                scmp_ct_to_str(strbuf, ntohs(scmp->class_), ntohs(scmp->type)), be64toh(id));
+        sock = pe->sock;
+        break;
+    default:
+        zlog_error(zc, "SCMP not supported for protocol %d", pld->meta->l4_proto);
+        goto cleanup;
     }
 
-    deliver_data(e->sock, from, buf, len);
+    deliver_data(sock, from, buf, len);
 cleanup:
     free(pld);
 }
@@ -1063,7 +1130,7 @@ void add_scmp_entry(SCMPL4Header *scmp, int sock)
         e->id = id;
         e->sock = sock;
         HASH_ADD(hh, ping_list, id, sizeof(id), e);
-        zlog_debug(zc, "SCMP entry added: sock=%d, id=%" PRIx64, sock, id);
+        zlog_debug(zc, "SCMP entry added: sock=%d, id=%" PRIx64, sock, be64toh(id));
     } else if (e->sock != sock) {
         zlog_error(zc, "failed adding SCMP echo mapping. ID %" PRIx64 " already in use.", be64toh(id));
     }

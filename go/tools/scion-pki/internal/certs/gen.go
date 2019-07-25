@@ -26,9 +26,10 @@ import (
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/crypto/cert"
-	"github.com/scionproto/scion/go/lib/crypto/trc"
-	"github.com/scionproto/scion/go/lib/trust"
+	"github.com/scionproto/scion/go/lib/keyconf"
+	"github.com/scionproto/scion/go/lib/scrypto/cert"
+	"github.com/scionproto/scion/go/lib/scrypto/trc"
+	"github.com/scionproto/scion/go/lib/util"
 	"github.com/scionproto/scion/go/tools/scion-pki/internal/conf"
 	"github.com/scionproto/scion/go/tools/scion-pki/internal/pkicmn"
 )
@@ -132,7 +133,7 @@ func genCert(ia addr.IA, isIssuer bool) error {
 
 // genIssuerCert generates a new issuer certificate according to conf.
 func genIssuerCert(issuerConf *conf.IssuerCert, s addr.IA) (*cert.Certificate, error) {
-	c, err := genCertCommon(issuerConf.BaseCert, s, trust.IssSigKeyFile)
+	c, err := genCertCommon(issuerConf.BaseCert, s, keyconf.IssSigKeyFile)
 	if err != nil {
 		return nil, err
 	}
@@ -142,9 +143,9 @@ func genIssuerCert(issuerConf *conf.IssuerCert, s addr.IA) (*cert.Certificate, e
 		c.Comment = fmt.Sprintf("Issuer Certificate for %s version %d.", c.Subject, c.Version)
 	}
 	issuerKeyPath := filepath.Join(pkicmn.GetAsPath(pkicmn.OutDir, c.Issuer), pkicmn.KeysDir,
-		trust.OnKeyFile)
+		keyconf.OnKeyFile)
 	// Load online root key to sign the certificate.
-	issuerKey, err := trust.LoadKey(issuerKeyPath)
+	issuerKey, err := keyconf.LoadKey(issuerKeyPath, issuerConf.SignAlgorithm)
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +170,7 @@ func genIssuerCert(issuerConf *conf.IssuerCert, s addr.IA) (*cert.Certificate, e
 
 // genASCert generates a new AS certificate according to 'conf'.
 func genASCert(conf *conf.AsCert, s addr.IA, issuerCert *cert.Certificate) (*cert.Chain, error) {
-	c, err := genCertCommon(conf.BaseCert, s, trust.SigKeyFile)
+	c, err := genCertCommon(conf.BaseCert, s, keyconf.SigKeyFile)
 	if err != nil {
 		return nil, err
 	}
@@ -184,8 +185,8 @@ func genASCert(conf *conf.AsCert, s addr.IA, issuerCert *cert.Certificate) (*cer
 			"issuer", c.Issuer, "subject", c.Subject)
 	}
 	issuerKeyPath := filepath.Join(pkicmn.GetAsPath(pkicmn.OutDir, conf.IssuerIA), pkicmn.KeysDir,
-		trust.IssSigKeyFile)
-	issuerKey, err := trust.LoadKey(issuerKeyPath)
+		keyconf.IssSigKeyFile)
+	issuerKey, err := keyconf.LoadKey(issuerKeyPath, issuerCert.SignAlgorithm)
 	if err != nil {
 		return nil, err
 	}
@@ -212,12 +213,12 @@ func genASCert(conf *conf.AsCert, s addr.IA, issuerCert *cert.Certificate) (*cer
 func genCertCommon(bc *conf.BaseCert, s addr.IA, signKeyFname string) (*cert.Certificate, error) {
 	// Load signing and decryption keys that will be in the certificate.
 	keyDir := filepath.Join(pkicmn.GetAsPath(pkicmn.OutDir, s), pkicmn.KeysDir)
-	signKey, err := trust.LoadKey(filepath.Join(keyDir, signKeyFname))
+	signKey, err := keyconf.LoadKey(filepath.Join(keyDir, signKeyFname), bc.SignAlgorithm)
 	if err != nil {
 		return nil, err
 	}
 	signPub := common.RawBytes(ed25519.PrivateKey(signKey).Public().(ed25519.PublicKey))
-	decKey, err := trust.LoadKey(filepath.Join(keyDir, trust.DecKeyFile))
+	decKey, err := keyconf.LoadKey(filepath.Join(keyDir, keyconf.DecKeyFile), bc.EncAlgorithm)
 	if err != nil {
 		return nil, err
 	}
@@ -227,9 +228,9 @@ func genCertCommon(bc *conf.BaseCert, s addr.IA, signKeyFname string) (*cert.Cer
 	// Determine issuingTime and calculate expiration time from validity.
 	issuingTime := bc.IssuingTime
 	if issuingTime == 0 {
-		issuingTime = uint64(time.Now().Unix())
+		issuingTime = util.TimeToSecs(time.Now())
 	}
-	expirationTime := issuingTime + uint64(bc.Validity.Seconds())
+	expirationTime := issuingTime + uint32(bc.Validity.Seconds())
 	return &cert.Certificate{
 		Comment:        bc.Comment,
 		SubjectSignKey: signPub,

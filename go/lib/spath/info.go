@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -27,14 +28,27 @@ const (
 	ErrorInfoFTooShort = "InfoF too short"
 )
 
+// Info Field format:
+//
+//   0                   1                   2                   3
+//   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |r r r r r P S C|                  Timestamp ...                |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//  |      ...      |              ISD              |     Hops      |
+//  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+//
 type InfoField struct {
 	// Previously Up, ConsDir = !Up
 	ConsDir  bool
 	Shortcut bool
 	Peer     bool
-	TsInt    uint32
-	ISD      uint16
-	Hops     uint8
+	// TsInt is the timestamp that denotes when the propagation of a path segment started.
+	// Use Timestamp() to get a time.Time value.
+	TsInt uint32
+	// ISD denotes the origin ISD of a path segment.
+	ISD  uint16
+	Hops uint8
 }
 
 func InfoFFromRaw(b []byte) (*InfoField, error) {
@@ -80,6 +94,7 @@ func (inf *InfoField) String() string {
 		inf.ISD, inf.Timestamp(), inf.Hops, inf.ConsDir, inf.Shortcut, inf.Peer)
 }
 
+// Timestamp returns TsInt as a time.Time.
 func (inf *InfoField) Timestamp() time.Time {
 	return time.Unix(int64(inf.TsInt), 0)
 }
@@ -90,4 +105,8 @@ func (inf *InfoField) WriteTo(w io.Writer) (int64, error) {
 	inf.Write(b)
 	n, err := w.Write(b)
 	return int64(n), err
+}
+
+func (h *InfoField) Eq(o *InfoField) bool {
+	return *h == *o
 }

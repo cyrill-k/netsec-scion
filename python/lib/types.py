@@ -1,4 +1,5 @@
 # Copyright 2015 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -46,12 +47,27 @@ class AddrType(TypeBase):
     SVC = 3
 
 
+############################
+# Service types
+############################
 class ServiceType(TypeBase):
+    # these values must be kept in sync with the common.capnp ServiceType enum
+    #: Unset
+    UNSET = "unset"
+    #: Beacon service
     BS = "bs"
+    #: Path service
     PS = "ps"
+    #: Certificate service
     CS = "cs"
-    BR = "br"
+    #: SIBRA service
     SIBRA = "sb"
+    #: Discovery service
+    DS = "ds"
+    #: Border router
+    BR = "br"
+    #: SCION-IP gateway
+    SIG = "sig"
 
 
 class ExtensionClass(TypeBase):

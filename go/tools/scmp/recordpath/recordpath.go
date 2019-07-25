@@ -24,7 +24,6 @@ import (
 	"github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/scmp"
 	"github.com/scionproto/scion/go/lib/spkt"
-
 	"github.com/scionproto/scion/go/tools/scmp/cmn"
 )
 
@@ -34,7 +33,7 @@ var (
 
 func Run() {
 	var n, pktLen int
-	var ext *scmp.Extn
+	var ext common.Extension
 
 	cmn.SetupSignals(nil)
 	if cmn.PathEntry != nil {
@@ -105,20 +104,14 @@ func prettyPrint(pkt *spkt.ScnPkt, pktLen int, info *scmp.InfoRecordPath, rtt ti
 func validate(pkt *spkt.ScnPkt, pathEntry *sciond.PathReplyEntry) (*scmp.Hdr,
 	*scmp.InfoRecordPath, error) {
 
-	scmpHdr, ok := pkt.L4.(*scmp.Hdr)
-	if !ok {
-		return nil, nil,
-			common.NewBasicError("Not an SCMP header", nil, "type", common.TypeOf(pkt.L4))
-	}
-	scmpPld, ok := pkt.Pld.(*scmp.Payload)
-	if !ok {
-		return nil, nil,
-			common.NewBasicError("Not an SCMP payload", nil, "type", common.TypeOf(pkt.Pld))
+	scmpHdr, scmpPld, err := cmn.Validate(pkt)
+	if err != nil {
+		return nil, nil, err
 	}
 	info, ok := scmpPld.Info.(*scmp.InfoRecordPath)
 	if !ok {
 		return nil, nil,
-			common.NewBasicError("Not an Info RecordPath", nil, "type", common.TypeOf(info))
+			common.NewBasicError("Not an Info RecordPath", nil, "type", common.TypeOf(scmpPld.Info))
 	}
 	if info.Id != id {
 		return nil, nil,

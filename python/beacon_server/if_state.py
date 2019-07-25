@@ -57,6 +57,18 @@ class InterfaceState(object):
             self.last_updated = curr_time
             return prev_state
 
+    def update_active(self):
+        """
+        Updates the last_updated timestamp *iff* the object is currently
+        in the active state. Returns True iff the object is active.
+        """
+        with self._lock:
+            curr_time = time.time()
+            if self._state == self.ACTIVE:
+                self.last_updated = curr_time
+                return True
+            return False
+
     def reset(self):
         """
         Resets the state of an InterfaceState object.

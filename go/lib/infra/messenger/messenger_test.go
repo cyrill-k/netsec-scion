@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 
 	. "github.com/smartystreets/goconvey/convey"
 
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/cert_mgmt"
 	"github.com/scionproto/scion/go/lib/infra"
@@ -51,7 +52,7 @@ func MockTRCHandler(request *infra.Request) {
 	}
 	subCtx, cancelF := context.WithTimeout(request.Context(), 3*time.Second)
 	defer cancelF()
-	if err := messenger.SendTRC(subCtx, mockTRC, &MockAddress{}, request.ID); err != nil {
+	if err := messenger.SendTRC(subCtx, mockTRC, nil, request.ID); err != nil {
 		log.Error("Server error", "err", err)
 	}
 }
@@ -59,8 +60,8 @@ func MockTRCHandler(request *infra.Request) {
 func TestTRCExchange(t *testing.T) {
 	Convey("Setup", t, func() {
 		c2s, s2c := p2p.New()
-		clientMessenger := setupMessenger(c2s, "client")
-		serverMessenger := setupMessenger(s2c, "server")
+		clientMessenger := setupMessenger(xtest.MustParseIA("1-ff00:0:1"), c2s, "client")
+		serverMessenger := setupMessenger(xtest.MustParseIA("2-ff00:0:1"), s2c, "server")
 
 		Convey("Client/server", xtest.Parallel(func(sc *xtest.SC) {
 			// The client sends a TRC request to the server, and receives the
@@ -69,7 +70,7 @@ func TestTRCExchange(t *testing.T) {
 			defer cancelF()
 
 			msg := &cert_mgmt.TRCReq{ISD: 42, Version: 1337, CacheOnly: true}
-			trc, err := clientMessenger.GetTRC(ctx, msg, &MockAddress{}, 1337)
+			trc, err := clientMessenger.GetTRC(ctx, msg, nil, 1337)
 			// CloseServer now, to guarantee it is run even if an assertion
 			// fails and execution of the client stops
 			serverMessenger.CloseServer()
@@ -78,16 +79,17 @@ func TestTRCExchange(t *testing.T) {
 		}, func(sc *xtest.SC) {
 			// The server receives a TRC request from the client, passes it to
 			// the mock TRCRequest handler which sends back the result.
-			serverMessenger.AddHandler(TRCRequest, infra.HandlerFunc(MockTRCHandler))
+			serverMessenger.AddHandler(infra.TRCRequest, infra.HandlerFunc(MockTRCHandler))
 			serverMessenger.ListenAndServe()
 		}))
 	})
 }
 
-func setupMessenger(conn net.PacketConn, name string) *Messenger {
+func setupMessenger(ia addr.IA, conn net.PacketConn, name string) *Messenger {
 	transport := rpt.New(conn, log.New("name", name))
 	dispatcher := disp.New(transport, DefaultAdapter, log.New("name", name))
-	return New(dispatcher, nil, log.Root().New("name", name))
+	config := &Config{DisableSignatureVerification: true}
+	return New(ia, dispatcher, nil, log.Root().New("name", name), config)
 }
 
 func TestMain(m *testing.M) {

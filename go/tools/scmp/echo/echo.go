@@ -17,28 +17,33 @@ package echo
 import (
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/hpkt"
 	"github.com/scionproto/scion/go/lib/scmp"
 	"github.com/scionproto/scion/go/lib/spkt"
-
 	"github.com/scionproto/scion/go/tools/scmp/cmn"
 )
 
 var (
 	id      uint64
 	recvSeq uint16
+	wg      sync.WaitGroup
 )
 
 func Run() {
 	cmn.SetupSignals(summary)
+	wg.Add(1)
 	go sendPkts()
 	recvPkts()
+	wg.Wait()
+	summary()
 }
 
 func sendPkts() {
+	defer wg.Done()
 	id = cmn.Rand()
 	info := &scmp.InfoEcho{Id: id, Seq: 0}
 	pkt := cmn.NewSCMPPkt(scmp.T_G_EchoRequest, info, nil)
@@ -108,16 +113,16 @@ func recvPkts() {
 		now := time.Now()
 		err = hpkt.ParseScnPkt(pkt, b[:pktLen])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: SCION packet parse error: %v\n", err)
-			break
+			fmt.Fprintf(os.Stderr, "ERROR: SCION packet parse: %v\n", err)
+			continue
 		}
 		// Validate packet
 		var scmpHdr *scmp.Hdr
 		var info *scmp.InfoEcho
 		scmpHdr, info, err = validate(pkt)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: SCMP validation error: %v\n", err)
-			break
+			fmt.Fprintf(os.Stderr, "ERROR: SCMP validation: %v\n", err)
+			continue
 		}
 		cmn.Stats.Recv += 1
 		if info.Seq > recvSeq {
@@ -136,31 +141,35 @@ func recvPkts() {
 		rtt := now.Sub(scmpHdr.Time()).Round(time.Microsecond)
 		prettyPrint(pkt, pktLen, info, rtt)
 	}
-	summary()
 }
 
 func summary() {
+	pktLoss := uint(0)
+	if cmn.Stats.Sent != 0 {
+		pktLoss = 100 - cmn.Stats.Recv*100/cmn.Stats.Sent
+	}
 	fmt.Printf("\n--- %s,[%s] statistics ---\n", cmn.Remote.IA, cmn.Remote.Host)
 	fmt.Printf("%d packets transmitted, %d received, %d%% packet loss, time %v\n",
-		cmn.Stats.Sent, cmn.Stats.Recv, 100-cmn.Stats.Recv*100/cmn.Stats.Sent,
+		cmn.Stats.Sent, cmn.Stats.Recv, pktLoss,
 		time.Since(cmn.Start).Round(time.Microsecond))
 }
 
 func validate(pkt *spkt.ScnPkt) (*scmp.Hdr, *scmp.InfoEcho, error) {
-	scmpHdr, ok := pkt.L4.(*scmp.Hdr)
-	if !ok {
-		return nil, nil,
-			common.NewBasicError("Not an SCMP header", nil, "type", common.TypeOf(pkt.L4))
-	}
-	scmpPld, ok := pkt.Pld.(*scmp.Payload)
-	if !ok {
-		return nil, nil,
-			common.NewBasicError("Not an SCMP payload", nil, "type", common.TypeOf(pkt.Pld))
+	scmpHdr, scmpPld, err := cmn.Validate(pkt)
+	if err != nil {
+		if scmpPld != nil && len(scmpPld.L4Hdr) > 0 {
+			// XXX Special case where the L4Hdr quote contains the Meta and Info fields
+			info, e := scmp.InfoEchoFromRaw(scmpPld.L4Hdr[scmp.HdrLen+scmp.MetaLen:])
+			if e == nil {
+				return nil, nil, common.NewBasicError("", err, "scmp_seq", info.Seq)
+			}
+		}
+		return nil, nil, err
 	}
 	info, ok := scmpPld.Info.(*scmp.InfoEcho)
 	if !ok {
 		return nil, nil,
-			common.NewBasicError("Not an Info Echo", nil, "type", common.TypeOf(info))
+			common.NewBasicError("Not an Info Echo", nil, "type", common.TypeOf(scmpPld.Info))
 	}
 	if info.Id != id {
 		return nil, nil,

@@ -18,6 +18,7 @@
 # Stdlib
 import logging
 import os
+import errno
 import threading
 import time
 from itertools import product
@@ -26,11 +27,11 @@ from itertools import product
 from external.expiring_dict import ExpiringDict
 
 # SCION
+from lib.app.sciond import get_default_sciond_path
 from lib.defines import (
     GEN_CACHE_PATH,
     PATH_FLAG_SIBRA,
     PATH_REQ_TOUT,
-    PATH_SERVICE,
     SCIOND_API_SOCKDIR,
 )
 from lib.errors import SCIONBaseError, SCIONParseError, SCIONServiceLookupError
@@ -108,12 +109,12 @@ class SCIONDaemon(SCIONElement):
     EMPTY_PATH_TTL = SEGMENT_TTL
 
     def __init__(self, conf_dir, addr, api_addr, run_local_api=False,
-                 port=None, spki_cache_dir=GEN_CACHE_PATH, prom_export=None):
+                 port=None, spki_cache_dir=GEN_CACHE_PATH, prom_export=None, delete_sock=False):
         """
         Initialize an instance of the class SCIONDaemon.
         """
         super().__init__("sciond", conf_dir, spki_cache_dir=spki_cache_dir,
-                         prom_export=prom_export, public=[(addr, port)])
+                         prom_export=prom_export, public=(addr, port))
         up_labels = {**self._labels, "type": "up"} if self._labels else None
         down_labels = {**self._labels, "type": "down"} if self._labels else None
         core_labels = {**self._labels, "type": "core"} if self._labels else None
@@ -127,9 +128,13 @@ class SCIONDaemon(SCIONElement):
         self._api_sock = None
         self.daemon_thread = None
         os.makedirs(SCIOND_API_SOCKDIR, exist_ok=True)
-        self.api_addr = (api_addr or
-                         os.path.join(SCIOND_API_SOCKDIR,
-                                      "%s.sock" % self.addr.isd_as))
+        self.api_addr = (api_addr or get_default_sciond_path())
+        if delete_sock:
+            try:
+                os.remove(self.api_addr)
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    logging.error("Could not delete socket %s: %s" % (self.api_addr, e))
 
         self.CTRL_PLD_CLASS_MAP = {
             PayloadClass.PATH: {
@@ -194,14 +199,8 @@ class SCIONDaemon(SCIONElement):
         assert isinstance(path_reply, PathSegmentReply), type(path_reply)
         recs = path_reply.recs()
         for srev_info in recs.iter_srev_infos():
-            try:
-                self.check_revocation(srev_info)
-            except SCIONBaseError as e:
-                logging.error("Revocation check failed for %s from %s:\n%s",
-                              srev_info.short_desc(), meta, e)
-                continue
-            self.rev_cache.add(srev_info)
-            self.remove_revoked_segments(srev_info.rev_info())
+            self.check_revocation(srev_info, lambda x: self.continue_revocation_processing(
+                                  srev_info) if not x else False, meta)
 
         req = path_reply.req()
         key = req.dst_ia(), req.flags()
@@ -215,6 +214,10 @@ class SCIONDaemon(SCIONElement):
             seg_meta = PathSegMeta(pcb, self.continue_seg_processing,
                                    meta, type_, params=(r,))
             self._process_path_seg(seg_meta, cpld.req_id)
+
+    def continue_revocation_processing(self, srev_info):
+        self.rev_cache.add(srev_info)
+        self.remove_revoked_segments(srev_info.rev_info())
 
     def continue_seg_processing(self, seg_meta):
         """
@@ -289,12 +292,6 @@ class SCIONDaemon(SCIONElement):
         request = pld.union
         assert isinstance(request, SCIONDPathRequest), type(request)
         req_id = pld.id
-        if request.p.flags.sibra:
-            logging.warning(
-                "Requesting SIBRA paths over SCIOND API not supported yet.")
-            self._send_path_reply(
-                req_id, [], SCIONDPathReplyError.INTERNAL, meta)
-            return
 
         dst_ia = request.dst_ia()
         src_ia = request.src_ia()
@@ -303,7 +300,7 @@ class SCIONDaemon(SCIONElement):
         thread = threading.current_thread()
         thread.name = "SCIONDaemon API id:%s %s -> %s" % (
             thread.ident, src_ia, dst_ia)
-        paths, error = self.get_paths(dst_ia, flush=request.p.flags.flush)
+        paths, error = self.get_paths(dst_ia, flush=request.p.flags.refresh)
         if request.p.maxPaths:
             paths = paths[:request.p.maxPaths]
 
@@ -314,8 +311,7 @@ class SCIONDaemon(SCIONElement):
             haddr, port = None, None
             if fwd_if:
                 br = self.ifid2br[fwd_if]
-                addr_idx = br.interfaces[fwd_if].addr_idx
-                haddr, port = br.int_addrs[addr_idx].public[0]
+                haddr, port = br.int_addrs.public
             addrs = [haddr] if haddr else []
             first_hop = HostInfo.from_values(addrs, port)
             reply_entry = SCIONDPathReplyEntry.from_values(
@@ -353,8 +349,7 @@ class SCIONDaemon(SCIONElement):
         if_entries = []
         for if_id, br in self.ifid2br.items():
             if all_brs or if_id in if_list:
-                addr_idx = br.interfaces[if_id].addr_idx
-                br_addr, br_port = br.int_addrs[addr_idx].public[0]
+                br_addr, br_port = br.int_addrs.public
                 info = HostInfo.from_values([br_addr], br_port)
                 reply_entry = SCIONDIFInfoReplyEntry.from_values(if_id, info)
                 if_entries.append(reply_entry)
@@ -384,9 +379,7 @@ class SCIONDaemon(SCIONElement):
     def _api_handle_rev_notification(self, pld, meta):
         request = pld.union
         assert isinstance(request, SCIONDRevNotification), type(request)
-        status = self.handle_revocation(CtrlPayload(PathMgmt(request.srev_info())), meta)
-        rev_reply = SCIONDMsg(SCIONDRevReply.from_values(status), pld.id)
-        self.send_meta(rev_reply.pack(), meta)
+        self.handle_revocation(CtrlPayload(PathMgmt(request.srev_info())), meta, pld)
 
     def _api_handle_seg_type_request(self, pld, meta):
         request = pld.union
@@ -425,37 +418,46 @@ class SCIONDaemon(SCIONElement):
         srev_info = SignedRevInfo.from_raw(pld.info.srev_info)
         self.handle_revocation(CtrlPayload(PathMgmt(srev_info)), meta)
 
-    def handle_revocation(self, cpld, meta):
+    def handle_revocation(self, cpld, meta, pld=None):
         pmgt = cpld.union
         srev_info = pmgt.union
         rev_info = srev_info.rev_info()
         assert isinstance(rev_info, RevocationInfo), type(rev_info)
         logging.debug("Received revocation: %s from %s", srev_info.short_desc(), meta)
-        try:
-            self.check_revocation(srev_info)
-        except RevInfoValidationError as e:
-            logging.error("Failed to validate RevInfo %s from %s: %s",
-                          srev_info.short_desc(), meta, e)
-            return SCIONDRevReplyStatus.INVALID
-        except RevInfoExpiredError as e:
-            logging.info("Ignoring expired Revinfo, %s from %s", srev_info.short_desc(), meta)
-            return SCIONDRevReplyStatus.STALE
-        except SignedRevInfoCertFetchError as e:
-            logging.error("Failed to fetch certificate for SignedRevInfo %s from %s: %s",
-                          srev_info.short_desc(), meta, e)
-            return SCIONDRevReplyStatus.UNKNOWN
-        except SignedRevInfoVerificationError as e:
-            logging.error("Failed to verify SRevInfo %s from %s: %s",
-                          srev_info.short_desc(), meta, e)
-            return SCIONDRevReplyStatus.SIGFAIL
-        except SCIONBaseError as e:
-            logging.error("Revocation check failed for %s from %s:\n%s",
-                          srev_info.short_desc(), meta, e)
-            return SCIONDRevReplyStatus.UNKNOWN
+        self.check_revocation(srev_info,
+                              lambda e: self.process_revocation(e, srev_info, meta, pld), meta)
 
-        self.rev_cache.add(srev_info)
-        self.remove_revoked_segments(rev_info)
-        return SCIONDRevReplyStatus.VALID
+    def process_revocation(self, error, srev_info, meta, pld):
+        rev_info = srev_info.rev_info()
+        status = None
+        if error is None:
+            status = SCIONDRevReplyStatus.VALID
+            self.rev_cache.add(srev_info)
+            self.remove_revoked_segments(rev_info)
+        else:
+            if type(error) == RevInfoValidationError:
+                logging.error("Failed to validate RevInfo %s from %s: %s",
+                              srev_info.short_desc(), meta, error)
+                status = SCIONDRevReplyStatus.INVALID
+            if type(error) == RevInfoExpiredError:
+                logging.info("Ignoring expired Revinfo, %s from %s", srev_info.short_desc(), meta)
+                status = SCIONDRevReplyStatus.STALE
+            if type(error) == SignedRevInfoCertFetchError:
+                logging.error("Failed to fetch certificate for SignedRevInfo %s from %s: %s",
+                              srev_info.short_desc(), meta, error)
+                status = SCIONDRevReplyStatus.UNKNOWN
+            if type(error) == SignedRevInfoVerificationError:
+                logging.error("Failed to verify SRevInfo %s from %s: %s",
+                              srev_info.short_desc(), meta, error)
+                status = SCIONDRevReplyStatus.SIGFAIL
+            if type(error) == SCIONBaseError:
+                logging.error("Revocation check failed for %s from %s:\n%s",
+                              srev_info.short_desc(), meta, error)
+                status = SCIONDRevReplyStatus.UNKNOWN
+
+        if pld:
+            rev_reply = SCIONDMsg(SCIONDRevReply.from_values(status), pld.id)
+            self.send_meta(rev_reply.pack(), meta)
 
     def remove_revoked_segments(self, rev_info):
         # Go through all segment databases and remove affected segments.
@@ -702,7 +704,7 @@ class SCIONDaemon(SCIONElement):
         Called to fetch the requested path.
         """
         try:
-            addr, port = self.dns_query_topo(PATH_SERVICE)[0]
+            addr, port = self.dns_query_topo(ServiceType.PS)[0]
         except SCIONServiceLookupError:
             log_exception("Error querying path service:")
             return

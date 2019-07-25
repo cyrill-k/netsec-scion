@@ -21,20 +21,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/crypto/ed25519"
-	"golang.org/x/crypto/nacl/box"
 
 	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/trust"
+	"github.com/scionproto/scion/go/lib/keyconf"
+	"github.com/scionproto/scion/go/lib/scrypto"
 	"github.com/scionproto/scion/go/tools/scion-pki/internal/conf"
 	"github.com/scionproto/scion/go/tools/scion-pki/internal/pkicmn"
-)
-
-const (
-	seedFileExt    = ".seed"
-	masterKeyFname = "master.key"
 )
 
 func runGenKey(args []string) {
@@ -61,33 +55,36 @@ func runGenKey(args []string) {
 
 func genAll(outDir string, core bool) error {
 	// Generate AS sigining and decryption keys.
-	if err := genKey(trust.SigKeyFile, outDir, genSignKey, true); err != nil {
+	if err := genKey(keyconf.SigKeyFile, outDir, genSignKey); err != nil {
 		return err
 	}
-	if err := genKey(trust.DecKeyFile, outDir, genEncKey, true); err != nil {
+	if err := genKey(keyconf.DecKeyFile, outDir, genEncKey); err != nil {
 		return err
 	}
-	// Generate AS master key.
-	if err := genKey(masterKeyFname, outDir, genMasterKey, false); err != nil {
+	// Generate AS master keys.
+	if err := genKey(keyconf.MasterKey0, outDir, genMasterKey); err != nil {
+		return err
+	}
+	if err := genKey(keyconf.MasterKey1, outDir, genMasterKey); err != nil {
 		return err
 	}
 	if !core {
 		return nil
 	}
 	// Generate core signing key.
-	if err := genKey(trust.IssSigKeyFile, outDir, genSignKey, true); err != nil {
+	if err := genKey(keyconf.IssSigKeyFile, outDir, genSignKey); err != nil {
 		return err
 	}
 	// Generate offline and online root keys if core was specified.
-	if err := genKey(trust.OffKeyFile, outDir, genSignKey, false); err != nil {
+	if err := genKey(keyconf.OffKeyFile, outDir, genSignKey); err != nil {
 		return err
 	}
-	return genKey(trust.OnKeyFile, outDir, genSignKey, false)
+	return genKey(keyconf.OnKeyFile, outDir, genSignKey)
 }
 
 type keyGenFunc func(io.Reader) ([]byte, error)
 
-func genKey(fname, outDir string, keyGenF keyGenFunc, writeSeed bool) error {
+func genKey(fname, outDir string, keyGenF keyGenFunc) error {
 	// Check if out directory exists and if not create it.
 	_, err := os.Stat(outDir)
 	if os.IsNotExist(err) {
@@ -114,33 +111,23 @@ func genKey(fname, outDir string, keyGenF keyGenFunc, writeSeed bool) error {
 	if err = pkicmn.WriteToFile([]byte(privKeyEnc), privKeyPath, 0600); err != nil {
 		return common.NewBasicError("Cannot write key file", err, "key", fname)
 	}
-	if !writeSeed {
-		return nil
-	}
-	// Write seed to file.
-	seedFname := strings.TrimSuffix(fname, filepath.Ext(fname)) + seedFileExt
-	seedPath := filepath.Join(outDir, seedFname)
-	seedEnc := base64.StdEncoding.EncodeToString(seed)
-	if err = pkicmn.WriteToFile([]byte(seedEnc), seedPath, 0600); err != nil {
-		return common.NewBasicError("Cannot write seed file", err, "seed", seedFname)
-	}
 	return nil
 }
 
 func genSignKey(rand io.Reader) ([]byte, error) {
-	_, private, err := ed25519.GenerateKey(rand)
+	_, private, err := scrypto.GenKeyPair(scrypto.Ed25519)
+	if err != nil {
+		return nil, err
+	}
+	return ed25519.PrivateKey(private).Seed(), nil
+}
+
+func genEncKey(rand io.Reader) ([]byte, error) {
+	_, private, err := scrypto.GenKeyPair(scrypto.Curve25519xSalsa20Poly1305)
 	if err != nil {
 		return nil, err
 	}
 	return private, nil
-}
-
-func genEncKey(rand io.Reader) ([]byte, error) {
-	_, private, err := box.GenerateKey(rand)
-	if err != nil {
-		return nil, err
-	}
-	return (*private)[:], nil
 }
 
 func genMasterKey(rand io.Reader) ([]byte, error) {

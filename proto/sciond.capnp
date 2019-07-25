@@ -3,6 +3,7 @@ using Go = import "go.capnp";
 $Go.package("proto");
 $Go.import("github.com/scionproto/scion/go/proto");
 
+using Common = import "common.capnp";
 using Sign = import "sign.capnp";
 using PSeg = import "path_seg.capnp";
 
@@ -30,8 +31,7 @@ struct PathReq {
     src @1 :UInt64;  # Source ISD-AS
     maxPaths @2: UInt16;  # Maximum number of paths requested
     flags :group {
-        flush @3 :Bool;  # Flush all paths to dst.
-        sibra @4 :Bool;  # True, if SIBRA paths are requested
+        refresh @3 :Bool; # Fetch segments again for dst.
     }
 }
 
@@ -101,15 +101,7 @@ struct IFInfoReplyEntry {
 }
 
 struct ServiceInfoRequest {
-    serviceTypes @0 :List(ServiceType);  # The service types for which a client requests the host infos. Empty list means all service types.
-
-    enum ServiceType {
-        bs @0;  # Beacon service
-        ps @1;  # Path service
-        cs @2;  # Certificate service
-        br @3;  # Router service
-        sb @4;  # SIBRA service
-    }
+    serviceTypes @0 :List(Common.ServiceType);  # The service types for which a client requests the host infos. Empty list means all service types.
 }
 
 struct ServiceInfoReply {
@@ -117,7 +109,7 @@ struct ServiceInfoReply {
 }
 
 struct ServiceInfoReplyEntry {
-    serviceType @0 :ServiceInfoRequest.ServiceType;  # The service ID of the service.
+    serviceType @0 :Common.ServiceType;  # The service ID of the service.
     ttl @1 :UInt32;  # The TTL for the service record in seconds (currently unused).
     hostInfos @2 :List(HostInfo);  # The host infos of the service.
 }
@@ -132,6 +124,6 @@ struct SegTypeHopReply {
 
 struct SegTypeHopReplyEntry {
     interfaces @0 :List(PathInterface);  # List of interfaces for the segment
-    timestamp @1 :UInt64;  # Creation timestamp, seconds since Unix Epoch
-    expTime @2 :UInt64;  # Expiration timestamp, seconds since Unix Epoch
+    timestamp @1 :UInt32;                # Creation timestamp, seconds since Unix Epoch
+    expTime @2 :UInt32;                  # Expiration timestamp, seconds since Unix Epoch
 }

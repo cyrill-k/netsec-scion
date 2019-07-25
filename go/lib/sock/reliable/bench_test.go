@@ -1,3 +1,5 @@
+// Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +23,8 @@ import (
 	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
+
+	_ "github.com/scionproto/scion/go/lib/scrypto" // Make sure math/rand is seeded
 )
 
 type SetupFunc func() interface{}
@@ -144,7 +148,6 @@ func benchmark(b *testing.B, setup SetupFunc, client EndpointFunc, server Endpoi
 }
 
 func setupTestNFunc() interface{} {
-	rand.Seed(time.Now().UnixNano())
 	msgs := make([]Msg, 1000)
 	for i := 0; i < len(msgs); i++ {
 		msgs[i].Buffer = make([]byte, rand.Intn(1280))

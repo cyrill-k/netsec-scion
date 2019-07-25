@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -72,8 +73,11 @@ func (o *rOneHopPath) HopF() (HookResult, *spath.HopField, error) {
 	// Retrieve the previous HopF, create a new HopF for this AS, and write it into the path header.
 	prevIdx := hOff - spath.HopFieldLength
 	prevHof := o.rp.Raw[prevIdx+1 : hOff]
-	inIFid := o.rp.Ingress.IfIDs[0]
-	hopF := spath.NewHopField(o.rp.Raw[hOff:], inIFid, 0)
+	inIFid := o.rp.Ingress.IfID
+	hopF := spath.HopField{
+		ConsIngress: inIFid,
+		ExpTime:     spath.DefaultHopFExpiry,
+	}
 	hfmac := o.rp.Ctx.Conf.HFMacPool.Get().(hash.Hash)
 	mac, err := hopF.CalcMac(hfmac, infoF.TsInt, prevHof)
 	o.rp.Ctx.Conf.HFMacPool.Put(hfmac)
@@ -81,7 +85,7 @@ func (o *rOneHopPath) HopF() (HookResult, *spath.HopField, error) {
 		return HookError, nil, err
 	}
 	hopF.Mac = mac
-	hopF.Write()
+	hopF.Write(o.rp.Raw[hOff:])
 	// Return HookContinue so that the default HopF parsing will read the newly
 	// created HopF out of the raw buffer.
 	return HookContinue, nil, nil

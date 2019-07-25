@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,14 +23,16 @@ import (
 	"github.com/scionproto/scion/go/border/rcmn"
 	"github.com/scionproto/scion/go/border/rctx"
 	"github.com/scionproto/scion/go/lib/addr"
+	"github.com/scionproto/scion/go/lib/assert"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/l4"
 	"github.com/scionproto/scion/go/lib/log"
+	"github.com/scionproto/scion/go/lib/overlay"
 	"github.com/scionproto/scion/go/lib/spkt"
 )
 
 // RtrPktFromScnPkt creates an RtrPkt from an spkt.ScnPkt.
-func RtrPktFromScnPkt(sp *spkt.ScnPkt, dirTo rcmn.Dir, ctx *rctx.Ctx) (*RtrPkt, error) {
+func RtrPktFromScnPkt(sp *spkt.ScnPkt, ctx *rctx.Ctx) (*RtrPkt, error) {
 	rp := NewRtrPkt()
 	rp.Ctx = ctx
 	totalLen := sp.TotalLen()
@@ -38,7 +41,6 @@ func RtrPktFromScnPkt(sp *spkt.ScnPkt, dirTo rcmn.Dir, ctx *rctx.Ctx) (*RtrPkt, 
 	rp.Id = log.RandId(4)
 	rp.Logger = log.New("rpkt", rp.Id)
 	rp.DirFrom = rcmn.DirSelf
-	rp.DirTo = dirTo
 	// Fill in common header.
 	rp.CmnHdr.DstType = sp.DstHost.Type()
 	rp.CmnHdr.SrcType = sp.SrcHost.Type()
@@ -68,19 +70,18 @@ func RtrPktFromScnPkt(sp *spkt.ScnPkt, dirTo rcmn.Dir, ctx *rctx.Ctx) (*RtrPkt, 
 		rp.CmnHdr.CurrHopF = uint8((rp.idxs.path + sp.Path.HopOff) / common.LineLen)
 	}
 	// Fill in extensions
-	rp.idxs.l4 = int(hdrLen) * common.LineLen // Will be updated as necessary by extnAddHBH and extnAddE2E
+	// rp.idxs.l4 Will be updated as necessary by extnAddHBH and extnAddE2E
+	rp.idxs.l4 = int(hdrLen) * common.LineLen
 	for _, se := range sp.HBHExt {
 		if err := rp.extnAddHBH(se); err != nil {
 			return nil, err
 		}
 	}
-
 	for _, se := range sp.E2EExt {
 		if err := rp.extnAddE2E(se); err != nil {
 			return nil, err
 		}
 	}
-
 	// Fill in L4 Header
 	rp.idxs.pld = int(hdrLen) * common.LineLen // Will be updated as necessary by addL4
 	if sp.L4 != nil {
@@ -97,6 +98,12 @@ func RtrPktFromScnPkt(sp *spkt.ScnPkt, dirTo rcmn.Dir, ctx *rctx.Ctx) (*RtrPkt, 
 		rp.Raw = rp.Raw[:rp.idxs.l4]
 		rp.CmnHdr.TotalLen = uint16(len(rp.Raw))
 		rp.CmnHdr.Write(rp.Raw)
+	}
+	if _, err := rp.InfoF(); err != nil {
+		return nil, err
+	}
+	if _, err := rp.ConsDirFlag(); err != nil {
+		return nil, err
 	}
 	return rp, nil
 }
@@ -170,15 +177,16 @@ func (rp *RtrPkt) CreateReplyScnPkt() (*spkt.ScnPkt, error) {
 	if err = sp.Reverse(); err != nil {
 		return nil, err
 	}
-	// Use the ingress address as the source host
 	sp.SrcIA = rp.Ctx.Conf.IA
-	sp.SrcHost = addr.HostFromIP(rp.Ingress.Dst.IP)
+	// Use the local address as the source host
+	pub := rp.Ctx.Conf.Net.LocAddr.PublicOverlay(rp.Ctx.Conf.Topo.Overlay)
+	sp.SrcHost = pub.L3()
 	return sp, nil
 }
 
 func (rp *RtrPkt) CreateReply(sp *spkt.ScnPkt) (*RtrPkt, error) {
 	// Convert back to RtrPkt
-	reply, err := RtrPktFromScnPkt(sp, rp.DirFrom, rp.Ctx)
+	reply, err := RtrPktFromScnPkt(sp, rp.Ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -193,8 +201,6 @@ func (rp *RtrPkt) CreateReply(sp *spkt.ScnPkt) (*RtrPkt, error) {
 			return nil, err
 		}
 		if hopF != nil && hopF.Xover {
-			reply.InfoF()
-			reply.ConsDirFlag()
 			// Always increment reversed path on a xover point.
 			if _, err := reply.IncPath(); err != nil {
 				return nil, err
@@ -209,8 +215,6 @@ func (rp *RtrPkt) CreateReply(sp *spkt.ScnPkt) (*RtrPkt, error) {
 				}
 			}
 		} else if rp.DirFrom == rcmn.DirExternal {
-			reply.InfoF()
-			reply.ConsDirFlag()
 			// Increase path if the current HOF is not xover and
 			// this router is an ingress router.
 			if _, err := reply.IncPath(); err != nil {
@@ -218,24 +222,46 @@ func (rp *RtrPkt) CreateReply(sp *spkt.ScnPkt) (*RtrPkt, error) {
 			}
 		}
 	}
-	egress, err := rp.replyEgress()
-	if err != nil {
+	if err := reply.replyEgress(rp.DirFrom, rp.Ingress.Src, rp.Ingress.IfID); err != nil {
 		return nil, err
 	}
-	reply.Egress = append(reply.Egress, egress)
 	return reply, nil
 }
 
 // replyEgress calculates the corresponding egress function and destination
 // address to use when replying to a packet.
-func (rp *RtrPkt) replyEgress() (EgressPair, error) {
-	if rp.DirFrom == rcmn.DirLocal {
-		return EgressPair{S: rp.Ctx.LocSockOut[rp.Ingress.LocIdx], Dst: rp.Ingress.Src}, nil
+func (rp *RtrPkt) replyEgress(dir rcmn.Dir, dst *overlay.OverlayAddr, ifid common.IFIDType) error {
+	// Destination is the local AS
+	if rp.dstIA.Eq(rp.Ctx.Conf.IA) {
+		// Write to local socket
+		rp.Egress = append(rp.Egress, EgressPair{S: rp.Ctx.LocSockOut, Dst: dst})
+		return nil
 	}
-	ifid, err := rp.IFCurr()
-	if err != nil {
-		return EgressPair{}, err
+	// Destination AS is not local
+	if dir == rcmn.DirExternal {
+		rp.Egress = append(rp.Egress, EgressPair{S: rp.Ctx.ExtSockOut[ifid]})
+		return nil
 	}
-	intf := rp.Ctx.Conf.Net.IFs[*ifid]
-	return EgressPair{S: rp.Ctx.ExtSockOut[*ifid], Dst: intf.RemoteAddr}, nil
+	if assert.On {
+		assert.Must(dir == rcmn.DirLocal, "Wrong direction value")
+	}
+	// DirFrom Local and destination is remote AS
+	// At this point we should have a valid path to route the packet
+	if _, err := rp.IFNext(); err != nil {
+		return err
+	}
+	if err := rp.validateLocalIF(rp.ifNext); err != nil {
+		return err
+	}
+	if _, ok := rp.Ctx.Conf.Net.IFs[*rp.ifNext]; ok {
+		// Egress interface is on this BR
+		// Re-inject to process the reply as an "Egress br"
+		// and make it look like it arrived in the local socket
+		rp.hooks.Route = append(rp.hooks.Route, rp.reprocess)
+		return nil
+	}
+	// Egress interface is not on this BR
+	// Write to local socket
+	rp.Egress = append(rp.Egress, EgressPair{S: rp.Ctx.LocSockOut, Dst: dst})
+	return nil
 }

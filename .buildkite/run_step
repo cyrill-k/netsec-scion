@@ -1,0 +1,23 @@
+#!/bin/bash
+
+echo "Running: ${1:?}"
+
+# Pull CI image and start it
+$BASE/scripts/registry_login
+docker pull $SCION_IMG
+mkdir -p $SCION_MOUNT
+./docker.sh start
+
+# Run test
+./tools/ci/"$@"
+res=$?
+
+# Pack logs and stop everything
+$BASE/scripts/pack_logs
+res=$((res+$?))
+./docker.sh stop
+res=$((res+$?))
+$BASE/scripts/clean_env
+res=$((res+$?))
+rm -r $SCION_MOUNT
+exit $res

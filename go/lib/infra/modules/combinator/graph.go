@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,13 +16,13 @@ package combinator
 
 import (
 	"bytes"
+	"fmt"
 	"sort"
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/seg"
 	"github.com/scionproto/scion/go/lib/sciond"
-	"github.com/scionproto/scion/go/lib/spath"
 	"github.com/scionproto/scion/go/proto"
 )
 
@@ -30,16 +30,16 @@ import (
 // them.
 type VertexInfo map[Vertex]EdgeMap
 
-// DAMG is a Directed Acyclic Multigraph.
+// DMG is a Directed Multigraph.
 //
 // Vertices are either ASes (identified by their ISD-AS number) or peering
 // links (identified by the the ISD-AS numbers of the peers, and the IFIDs on
 // the peering link).
-type DAMG struct {
+type DMG struct {
 	Adjacencies map[Vertex]VertexInfo
 }
 
-// NewDAMG creates a new graph from sets of path segments.
+// NewDMG creates a new graph from sets of path segments.
 //
 // The input segments are traversed to construct the graph. Each segment is
 // traversed in reverse, from the last AS Entry to the first one. During this
@@ -69,8 +69,8 @@ type DAMG struct {
 // current ASEntry in the ASEntries array. The direction of the edge is from
 // pinnedIA to the peering vertex for up-segments, and the reverse for
 // down-segments. PeerID is set to the index of the current hop entry.
-func NewDAMG(ups, cores, downs []*seg.PathSegment) *DAMG {
-	g := &DAMG{
+func NewDMG(ups, cores, downs []*seg.PathSegment) *DMG {
+	g := &DMG{
 		Adjacencies: make(map[Vertex]VertexInfo),
 	}
 	for _, segment := range ups {
@@ -85,7 +85,7 @@ func NewDAMG(ups, cores, downs []*seg.PathSegment) *DAMG {
 	return g
 }
 
-func (g *DAMG) traverseSegment(segment *InputSegment) {
+func (g *DMG) traverseSegment(segment *InputSegment) {
 	asEntries := segment.ASEntries
 
 	// Directly process core segments, because we're not interested in
@@ -155,7 +155,7 @@ func (g *DAMG) traverseSegment(segment *InputSegment) {
 	}
 }
 
-func (g *DAMG) AddEdge(src, dst Vertex, segment *InputSegment, edge *Edge) {
+func (g *DMG) AddEdge(src, dst Vertex, segment *InputSegment, edge *Edge) {
 	if _, ok := g.Adjacencies[src]; !ok {
 		g.Adjacencies[src] = make(VertexInfo)
 	}
@@ -170,7 +170,7 @@ func (g *DAMG) AddEdge(src, dst Vertex, segment *InputSegment, edge *Edge) {
 }
 
 // GetPaths returns all the paths from src to dst, sorted according to weight.
-func (g *DAMG) GetPaths(src, dst Vertex) PathSolutionList {
+func (g *DMG) GetPaths(src, dst Vertex) PathSolutionList {
 	var solutions PathSolutionList
 	queue := PathSolutionList{&PathSolution{currentVertex: src}}
 	for len(queue) > 0 {
@@ -179,11 +179,16 @@ func (g *DAMG) GetPaths(src, dst Vertex) PathSolutionList {
 
 		for nextVertex, edgeList := range g.Adjacencies[currentPathSolution.currentVertex] {
 			for segment, edge := range edgeList {
+				// Makes sure the the segment would be valid in a path.
+				if !validNextSeg(currentPathSolution.currentSeg, segment) {
+					continue
+				}
 				// Create a copy of the old solution s.t. trail slices do not
 				// get mixed during appends.
 				newSolution := &PathSolution{
 					edges:         append([]*solutionEdge{}, currentPathSolution.edges...),
 					currentVertex: nextVertex,
+					currentSeg:    segment,
 					cost:          currentPathSolution.cost + edge.Weight,
 				}
 
@@ -211,7 +216,7 @@ func (g *DAMG) GetPaths(src, dst Vertex) PathSolutionList {
 }
 
 // Vertex is a union-like type for the AS vertices and Peering link vertices in
-// a DAMG that can be used as key in maps.
+// a DMG that can be used as key in maps.
 type Vertex struct {
 	IA       addr.IA
 	UpIA     addr.IA
@@ -240,7 +245,7 @@ func (v Vertex) Reverse() Vertex {
 // The edges are keyed by path segment pointer.
 type EdgeMap map[*InputSegment]*Edge
 
-// Edge represents an edge for the DAMG.
+// Edge represents an edge for the DMG.
 type Edge struct {
 	Weight int
 	// Shortcut is the ASEntry index on where the forwarding portion of this
@@ -259,12 +264,14 @@ type PathSolution struct {
 	edges []*solutionEdge
 	// currentVertex is the currentVertex being visited
 	currentVertex Vertex
+	// currentSeg is the current segment being visited
+	currentSeg *InputSegment
 	// cost is the sum of edge weights
 	cost int
 }
 
 // GetFwdPathMetadata builds the complete metadata for a forwarding path by
-// extracting it from a path between source and destination in the DAMG.
+// extracting it from a path between source and destination in the DMG.
 func (solution *PathSolution) GetFwdPathMetadata() *Path {
 	path := &Path{
 		Weight: solution.cost,
@@ -272,8 +279,7 @@ func (solution *PathSolution) GetFwdPathMetadata() *Path {
 	}
 	for edgeIdx, solEdge := range solution.edges {
 		currentSeg := &Segment{
-			Type:    solEdge.segment.Type,
-			ExpTime: spath.MaxTimestamp,
+			Type: solEdge.segment.Type,
 		}
 		currentSeg.initInfoFieldFrom(solEdge.segment.PathSegment)
 		currentSeg.InfoField.ConsDir = solEdge.segment.IsDownSeg()
@@ -291,8 +297,6 @@ func (solution *PathSolution) GetFwdPathMetadata() *Path {
 
 			// Normal hop field.
 			newHF := currentSeg.appendHopFieldFrom(asEntry.HopEntries[0])
-			currentSeg.ExpTime = minUint32(currentSeg.ExpTime,
-				uint32(newHF.ExpTime)*spath.ExpTimeUnit)
 			inIFID, outIFID = newHF.ConsEgress, newHF.ConsIngress
 
 			// If we've transitioned from a previous segment, set Xover flag.
@@ -319,15 +323,17 @@ func (solution *PathSolution) GetFwdPathMetadata() *Path {
 				}
 
 				if solEdge.edge.Shortcut != 0 {
+					if solEdge.segment.IsDownSeg() && edgeIdx == 1 {
+						newHF.Xover = true
+					}
+
 					if solEdge.edge.Peer != 0 {
-						// We're crossing a peering shortcut. Always set Xover flag
-						// for the current hop field, even if on last segment.
+						// Always set Xover flag for the current hop field,
+						// even if on last segment.
 						newHF.Xover = true
 						// Add a new hop field for the peering entry, and set Xover.
 						pHF := currentSeg.appendHopFieldFrom(asEntry.HopEntries[solEdge.edge.Peer])
 						pHF.Xover = true
-						currentSeg.ExpTime = minUint32(currentSeg.ExpTime,
-							uint32(pHF.ExpTime)*spath.ExpTimeUnit)
 						inIFID, outIFID = pHF.ConsEgress, pHF.ConsIngress
 					} else {
 						// Normal shortcut, so only half of this HF is traversed by the packet
@@ -345,8 +351,16 @@ func (solution *PathSolution) GetFwdPathMetadata() *Path {
 	}
 	path.reverseDownSegment()
 	path.aggregateInterfaces()
-	path.computeExpTime()
 	return path
+}
+
+// Segments returns the segments in this path
+func (solution *PathSolution) Segments() []*InputSegment {
+	segs := make([]*InputSegment, 0, len(solution.edges))
+	for _, e := range solution.edges {
+		segs = append(segs, e.segment)
+	}
+	return segs
 }
 
 // PathSolutionList is a sort.Interface implementation for a slice of solutions.
@@ -434,4 +448,23 @@ func getPathInterfaces(ia addr.IA, inIFID, outIFID common.IFIDType) []sciond.Pat
 			sciond.PathInterface{RawIsdas: ia.IAInt(), IfID: outIFID})
 	}
 	return result
+}
+
+// validNextSeg returns whether nextSeg is a valid next segment in a path from the given currSeg.
+// A path can only contain at most 1 up, 1 core, and 1 down segment.
+func validNextSeg(currSeg, nextSeg *InputSegment) bool {
+	if currSeg == nil {
+		// If we have no segment any segment can be first.
+		return true
+	}
+	switch currSeg.Type {
+	case proto.PathSegType_up:
+		return nextSeg.Type == proto.PathSegType_core || nextSeg.Type == proto.PathSegType_down
+	case proto.PathSegType_core:
+		return nextSeg.Type == proto.PathSegType_down
+	case proto.PathSegType_down:
+		return false
+	default:
+		panic(fmt.Sprintf("Invalid segment type: %v", currSeg.Type))
+	}
 }

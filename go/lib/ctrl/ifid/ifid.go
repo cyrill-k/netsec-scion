@@ -26,8 +26,7 @@ import (
 var _ proto.Cerealizable = (*IFID)(nil)
 
 type IFID struct {
-	OrigIfID  uint64 `capnp:"origIF"`
-	RelayIfID uint64 `capnp:"relayIF"`
+	OrigIfID common.IFIDType `capnp:"origIF"`
 }
 
 func NewFromRaw(b common.RawBytes) (*IFID, error) {
@@ -44,5 +43,5 @@ func (i *IFID) Write(b common.RawBytes) (int, error) {
 }
 
 func (i *IFID) String() string {
-	return fmt.Sprintf("OrigIfID: %d, RelayIfID: %d", i.OrigIfID, i.RelayIfID)
+	return fmt.Sprintf("OrigIfID: %d", i.OrigIfID)
 }

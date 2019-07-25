@@ -6,12 +6,12 @@ build_dir=
 image_tag=
 
 get_params() {
-  # If we're on a local branch, use that. If we're on a detached HEAD from a
-  # remote branch, or from a bare rev id, use that instead.
-  branch=$(LC_ALL=C git status | head -n1 |
-           awk '/^On branch|HEAD detached at/ {print $NF}')
-  build_dir="docker/_build/$branch"
-  image_tag=$(echo "$branch" | tr '/' '.')
+    # If we're on a local branch, use that. If we're on a detached HEAD from a
+    # remote branch, or from a bare rev id, use that instead.
+    branch=$(LC_ALL=C git status | head -n1 |
+    awk '/^On branch|HEAD detached at/ {print $NF}')
+    build_dir="docker/_build/$branch"
+    image_tag=$(echo "$branch" | tr '/' '.')
 }
 
 cmd_base() {
@@ -21,6 +21,7 @@ cmd_base() {
     copy_tree
     docker_build "base"
     docker tag scion_base:latest "$ORG/scion_base:pending"
+    touch docker/_build/scion_base.stamp
 }
 
 cmd_build() {
@@ -31,6 +32,11 @@ cmd_build() {
     docker_build
 }
 
+cmd_tester() {
+    set -eo pipefail
+    make -C docker/perapp base
+    docker build -t "tester:latest" - < docker/Dockerfile.tester
+}
 
 copy_tree() {
     set -e
@@ -47,7 +53,6 @@ copy_tree() {
     echo
 }
 
-
 docker_build() {
     set -e
     set -o pipefail
@@ -57,6 +62,7 @@ docker_build() {
     local conf="${build_dir:?}/scion.git/$conf_rel"
     local tag="$image_name:${image_tag:?}"
     local log="$build_dir/build${suffix:+_$suffix}.log"
+    [ -n "$suffix" ] || local build_args="--build-arg SCION_UID=$(id -u) --build-arg SCION_GID=$(id -g) --build-arg DOCKER_GID=$(getent group docker | cut -f3 -d:)"
     echo "Building ${suffix:+$suffix }Docker image"
     echo "=========================="
     echo "Image: $tag"
@@ -64,8 +70,9 @@ docker_build() {
     echo "Log: $log"
     echo "=========================="
     echo
-    docker build $DOCKER_ARGS -f "$conf" -t "$tag" "$build_dir/scion.git" | tee "$log"
+    docker build $DOCKER_ARGS -f "$conf" -t "$tag" $build_args "$build_dir/scion.git" | tee "$log"
     docker tag "$tag" "$image_name:latest"
+    touch docker/_build/scion.stamp
 }
 
 cmd_clean() {
@@ -77,28 +84,83 @@ cmd_clean() {
     rm -rf docker/_build/
 }
 
-cmd_run() {
+common_args() {
     # Limit to 4G of ram, don't allow swapping.
-    local args="-i -t -h scion -m 4096M --memory-swap=4096M --shm-size=1024M $DOCKER_ARGS"
-    args+=" -v $PWD/htmlcov:/home/scion/go/src/github.com/scionproto/scion/htmlcov"
-    args+=" -v $PWD/logs:/home/scion/go/src/github.com/scionproto/scion/logs"
-    args+=" -v $PWD/sphinx-doc/_build:/home/scion/go/src/github.com/scionproto/scion/sphinx-doc/_build"
-    # Can't use --rm in circleci, their environment doesn't allow it, so it
-    # just throws an error
-    [ -n "$CIRCLECI" ] || args+=" --rm"
+    local args="-h scion -m 4GB --memory-swap=4GB --shm-size=1024M $DOCKER_ARGS"
+    args+=" -v /var/run/docker.sock:/var/run/docker.sock"
+    args+=" -v $SCION_MOUNT/gen:/home/scion/go/src/github.com/scionproto/scion/gen"
+    args+=" -v $SCION_MOUNT/logs:/home/scion/go/src/github.com/scionproto/scion/logs"
+    args+=" -v $SCION_MOUNT/gen-certs:/home/scion/go/src/github.com/scionproto/scion/gen-certs"
+    args+=" -v $SCION_MOUNT/gen-cache:/home/scion/go/src/github.com/scionproto/scion/gen-cache"
+    args+=" -v $SCION_MOUNT/htmlcov:/home/scion/go/src/github.com/scionproto/scion/python/htmlcov"
+    args+=" -e SCION_OUTPUT_BASE=$SCION_MOUNT"
+    args+=" -e SCION_UID=$(id -u)"
+    args+=" -e SCION_GID=$(id -g)"
+    args+=" -e DOCKER_GID=$(getent group docker | cut -f3 -d:)"
+    args+=" -e SCION_USERSPEC=$(id -un):$(id -gn)"
+    args+=" -u root"
+    args+=" -e DOCKER0=$(./tools/docker-ip)"
+    echo $args
+}
+
+cmd_run() {
+    set -e
+    SCION_MOUNT=${SCION_MOUNT:-$(mktemp -d /tmp/scion_out.XXXXXX)}
+    echo "SCION_MOUNT directory: $SCION_MOUNT"
+    local img=${SCION_IMG:-scion}
+    local args=$(common_args)
+    args+=" -i -t --rm --entrypoint=/docker-entrypoint.sh"
     setup_volumes
-    docker run $args scion "$@"
+    docker run $args "$img" "$@"
+}
+
+cmd_start() {
+    set -e
+    SCION_MOUNT=${SCION_MOUNT:-$(mktemp -d /tmp/scion_out.XXXXXX)}
+    echo "SCION_MOUNT directory: $SCION_MOUNT"
+    local img=${SCION_IMG:-scion}
+    local cntr=${SCION_CNTR:-scion}
+    if docker container inspect "$cntr" &>/dev/null; then
+        echo "Removing stale $cntr container"
+        ./tools/quiet docker rm -f "$cntr"
+    fi
+    local args=$(common_args)
+    args+=" --name $cntr"
+    setup_volumes
+    ./tools/quiet docker container create $args "$img" -c "tail -f /dev/null"
+    ./tools/quiet docker start "$cntr"
+    # Adjust ownership of mounted dirs
+    docker exec "$cntr" /docker-entrypoint.sh
+}
+
+cmd_exec() {
+    local cntr=${SCION_CNTR:-scion}
+    docker exec -it -u scion "$cntr" bash -l -c "$*"
+}
+
+cmd_stop() {
+    local cntr=${SCION_CNTR:-scion}
+    echo "Stopping $cntr container"; ./tools/quiet docker stop "$cntr";
+    echo "Removing $cntr container"; ./tools/quiet docker rm "$cntr";
 }
 
 setup_volumes() {
     set -e
-    for i in htmlcov logs sphinx-doc/_build; do
-        mkdir -p "$i"
+    for i in gen logs gen-certs gen-cache htmlcov; do
+        mkdir -p "$SCION_MOUNT/$i"
         # Check dir exists, and is owned by the current (effective) user. If
         # it's owned by the wrong user, the docker environment won't be able to
         # write to it.
-        [ -O "$i" ] || { echo "Error: '$i' dir not owned by $LOGNAME"; exit 1; }
+        [ -O "$SCION_MOUNT/$i" ] || { echo "Error: '$SCION_MOUNT/$i' dir not owned by $LOGNAME"; exit 1; }
     done
+    # Make sure the socket dirs have the correct permissions. Unlike for the volumes we try to fix
+    # the permissions if necessary.
+    local disp_dir="/run/shm/dispatcher"
+    [ -d "$disp_dir" ] || mkdir "$disp_dir"
+    [ $(stat -c "%U" "$disp_dir") == "$LOGNAME" ] || { sudo -p "Fixing ownership of $disp_dir - [sudo] password for %p: " chown $LOGNAME: "$disp_dir"; }
+    local sciond_dir="/run/shm/sciond"
+    [ -d "$sciond_dir" ] || mkdir "$sciond_dir"
+    [ $(stat -c "%U" "$sciond_dir") == "$LOGNAME" ] || { sudo -p "Fixing ownership of $sciond_dir - [sudo] password for %p: " chown $LOGNAME: "$sciond_dir"; }
 }
 
 stop_cntrs() {
@@ -137,9 +199,17 @@ del_imgs() {
 cmd_help() {
 	cat <<-_EOF
 	Usage:
+	    $PROGRAM base
 	    $PROGRAM build
+	    $PROGRAM tester
 	    $PROGRAM run
 	        Run the Docker image.
+	    $PROGRAM start
+	        Start a Docker container.
+	    $PROGRAM exec
+	        Execute a command in a running container.
+	    $PROGRAM stop
+	        Stop the Docker container.
 	    $PROGRAM clean
 	        Remove all Docker containers and all generated images.
 	    $PROGRAM help
@@ -152,8 +222,10 @@ PROGRAM="${0##*/}"
 COMMAND="$1"
 ARG="$2"
 
-if ! ( [ $(id -u) -eq 0 ] || groups | grep -q "\<docker\>"; ); then
-    echo "Error: you must either be root, or in the 'docker' group"
+[ $(id -u) -eq 0 ] && { echo "Error: running as root is not allowed!" && exit 1; }
+
+if ! ( groups | grep -q "\<docker\>"; ); then
+    echo "Error: you must be in the 'docker' group"
     exit 1
 fi
 
@@ -165,8 +237,12 @@ fi
 case $COMMAND in
     base)               cmd_base ;;
     build)              cmd_build ;;
+    tester)             cmd_tester ;;
     clean)              shift; cmd_clean "$@" ;;
     run)                shift; cmd_run "$@" ;;
+    start)              cmd_start ;;
+    exec)               shift; cmd_exec "$@" ;;
+    stop)               shift; cmd_stop "$@" ;;
     help)               cmd_help ;;
     *)                  cmd_help ;;
 esac

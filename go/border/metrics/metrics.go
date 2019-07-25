@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -71,24 +72,18 @@ func Init(elem string) {
 
 	// Some closures to reduce boiler-plate.
 	newCVec := func(name, help string, lNames []string) *prometheus.CounterVec {
-		v := prom.NewCounterVec(namespace, "", name, help, constLabels, lNames)
-		prometheus.MustRegister(v)
-		return v
+		return prom.NewCounterVec(namespace, "", name, help, constLabels, lNames)
 	}
 	newG := func(name, help string) prometheus.Gauge {
-		v := prom.NewGauge(namespace, "", name, help, constLabels)
-		prometheus.MustRegister(v)
-		return v
+		return prom.NewGauge(namespace, "", name, help, constLabels)
 	}
 	newGVec := func(name, help string, lNames []string) *prometheus.GaugeVec {
-		v := prom.NewGaugeVec(namespace, "", name, help, constLabels, lNames)
-		prometheus.MustRegister(v)
-		return v
+		return prom.NewGaugeVec(namespace, "", name, help, constLabels, lNames)
 	}
-	newHVec := func(name, help string, lNames []string, buckets []float64) *prometheus.HistogramVec {
-		v := prom.NewHistogramVec(namespace, "", name, help, constLabels, lNames, buckets)
-		prometheus.MustRegister(v)
-		return v
+	newHVec := func(name, help string,
+		lNames []string, buckets []float64) *prometheus.HistogramVec {
+
+		return prom.NewHistogramVec(namespace, "", name, help, constLabels, lNames, buckets)
 	}
 
 	InputPkts = newCVec("input_pkts_total", "Total number of input packets received.", sockLabels)
@@ -142,6 +137,9 @@ func Start() error {
 		return common.NewBasicError("Unable to bind prometheus metrics port", err)
 	}
 	log.Info("Exporting prometheus metrics", "addr", *promAddr)
-	go http.Serve(ln, nil)
+	go func() {
+		defer log.LogPanicAndExit()
+		http.Serve(ln, nil)
+	}()
 	return nil
 }

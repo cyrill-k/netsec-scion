@@ -25,7 +25,6 @@ import (
 	"github.com/scionproto/scion/go/lib/scmp"
 	"github.com/scionproto/scion/go/lib/spath"
 	"github.com/scionproto/scion/go/lib/spkt"
-
 	"github.com/scionproto/scion/go/tools/scmp/cmn"
 )
 
@@ -37,7 +36,7 @@ var (
 
 func Run() {
 	var hopOff uint8
-	var ext *scmp.Extn
+	var ext common.Extension
 	var path *spath.Path
 	var total uint = 1
 
@@ -100,13 +99,13 @@ func Run() {
 		err = hpkt.ParseScnPkt(pktRecv, b[:pktLen])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: SCION packet parse error: %v\n", err)
-			break
+			continue
 		}
 		// Validate packet
 		scmpHdr, infoRecv, err = validate(pktRecv, cmn.PathEntry)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: SCMP validation error: %v\n", err)
-			break
+			continue
 		}
 		// Calculate return time
 		rtt = now.Sub(scmpHdr.Time()).Round(time.Microsecond)
@@ -148,7 +147,7 @@ func prettyPrint(pkt *spkt.ScnPkt, info *scmp.InfoTraceRoute, rtt time.Duration)
 
 // hopPktOff returns HopF offset relative to the packet
 func hopPktOff(offset int) uint8 {
-	off := spkt.CmnHdrLen + spkt.AddrHdrLen(cmn.Local.Host, cmn.Remote.Host) + offset
+	off := spkt.CmnHdrLen + spkt.AddrHdrLen(cmn.Local.Host.L3, cmn.Remote.Host.L3) + offset
 	return uint8(off / common.LineLen)
 }
 
@@ -179,20 +178,14 @@ func updateHopField(pkt *spkt.ScnPkt, info *scmp.InfoTraceRoute, path *spath.Pat
 func validate(pkt *spkt.ScnPkt, pathEntry *sciond.PathReplyEntry) (*scmp.Hdr,
 	*scmp.InfoTraceRoute, error) {
 
-	scmpHdr, ok := pkt.L4.(*scmp.Hdr)
-	if !ok {
-		return nil, nil,
-			common.NewBasicError("Not an SCMP header", nil, "type", common.TypeOf(pkt.L4))
-	}
-	scmpPld, ok := pkt.Pld.(*scmp.Payload)
-	if !ok {
-		return nil, nil,
-			common.NewBasicError("Not an SCMP payload", nil, "type", common.TypeOf(pkt.Pld))
+	scmpHdr, scmpPld, err := cmn.Validate(pkt)
+	if err != nil {
+		return nil, nil, err
 	}
 	info, ok := scmpPld.Info.(*scmp.InfoTraceRoute)
 	if !ok {
 		return nil, nil,
-			common.NewBasicError("Not an Info TraceRoute", nil, "type", common.TypeOf(info))
+			common.NewBasicError("Not an Info TraceRoute", nil, "type", common.TypeOf(scmpPld.Info))
 	}
 	if info.Id != id {
 		return nil, nil,

@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,21 +23,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang/mock/gomock"
 	. "github.com/smartystreets/goconvey/convey"
 
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/crypto/cert"
-	"github.com/scionproto/scion/go/lib/crypto/trc"
+	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/cert_mgmt"
 	"github.com/scionproto/scion/go/lib/infra"
 	"github.com/scionproto/scion/go/lib/infra/disp"
 	"github.com/scionproto/scion/go/lib/infra/messenger"
-	"github.com/scionproto/scion/go/lib/infra/modules/trust/trustdb"
+	"github.com/scionproto/scion/go/lib/infra/mock_infra"
+	"github.com/scionproto/scion/go/lib/infra/modules/itopo"
+	"github.com/scionproto/scion/go/lib/infra/modules/trust/trustdb/trustdbsqlite"
 	"github.com/scionproto/scion/go/lib/log"
+	"github.com/scionproto/scion/go/lib/scrypto"
+	"github.com/scionproto/scion/go/lib/scrypto/cert"
+	"github.com/scionproto/scion/go/lib/scrypto/trc"
 	"github.com/scionproto/scion/go/lib/snet/rpt"
+	"github.com/scionproto/scion/go/lib/topology"
+	"github.com/scionproto/scion/go/lib/topology/topotestutil"
 	"github.com/scionproto/scion/go/lib/xtest"
 	"github.com/scionproto/scion/go/lib/xtest/loader"
 	"github.com/scionproto/scion/go/lib/xtest/p2p"
+	"github.com/scionproto/scion/go/proto"
+)
+
+const (
+	testCtxTimeout = 200 * time.Millisecond
 )
 
 var (
@@ -98,93 +110,97 @@ func regenerateCrypto() error {
 	return nil
 }
 
+func newMessengerMock(ctrl *gomock.Controller,
+	trcs map[addr.ISD]*trc.TRC, chains map[addr.IA]*cert.Chain) infra.Messenger {
+
+	msger := mock_infra.NewMockMessenger(ctrl)
+	msger.EXPECT().GetTRC(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, msg *cert_mgmt.TRCReq,
+			a net.Addr, id uint64) (*cert_mgmt.TRC, error) {
+
+			trcObj, ok := trcs[msg.ISD]
+			if !ok {
+				return nil, common.NewBasicError("TRC not found", nil)
+			}
+
+			compressedTRC, err := trcObj.Compress()
+			if err != nil {
+				return nil, common.NewBasicError("Unable to compress TRC", nil)
+			}
+			return &cert_mgmt.TRC{RawTRC: compressedTRC}, nil
+		},
+	).AnyTimes()
+	msger.EXPECT().GetCertChain(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, msg *cert_mgmt.ChainReq,
+			a net.Addr, id uint64) (*cert_mgmt.Chain, error) {
+
+			chain, ok := chains[msg.IA()]
+			if !ok {
+				return nil, common.NewBasicError("Chain not found", nil)
+			}
+
+			compressedChain, err := chain.Compress()
+			if err != nil {
+				return nil, common.NewBasicError("Unable to compress Chain", nil)
+			}
+			return &cert_mgmt.Chain{RawChain: compressedChain}, nil
+		},
+	).AnyTimes()
+	return msger
+}
+
 func TestGetValidTRC(t *testing.T) {
 	trcs, chains := loadCrypto(t, isds, ias)
 
 	testCases := []struct {
 		Name          string
 		ISD           addr.ISD
-		Trail         []addr.ISD
 		ExpData       *trc.TRC
 		ExpError      bool
 		DBTRCInChecks []*trc.TRC // Check that these objects were saved to persistent storage
 	}{
 		{
-			Name: "bad ISD=0",
-			ISD:  0, Trail: []addr.ISD{0},
-			ExpData: nil, ExpError: true,
+			Name:     "bad ISD=0",
+			ISD:      0,
+			ExpData:  nil,
+			ExpError: true,
 		},
 		{
-			Name: "local ISD=1",
-			ISD:  1, Trail: []addr.ISD{1},
-			ExpData: trcs[1], ExpError: false,
+			Name:          "local ISD=1",
+			ISD:           1,
+			ExpData:       trcs[1],
+			ExpError:      false,
+			DBTRCInChecks: []*trc.TRC{trcs[1]},
 		},
 		{
-			Name: "unknown ISD=2, nil trail",
-			ISD:  2, Trail: nil,
-			ExpData: nil, ExpError: true,
-		},
-		{
-			Name: "unknown ISD=2, empty trail",
-			ISD:  2, Trail: []addr.ISD{},
-			ExpData: nil, ExpError: true,
-		},
-		{
-			Name: "unknown ISD=5, bad trail",
-			ISD:  5, Trail: []addr.ISD{1, 2, 3},
-			ExpData: nil, ExpError: true,
-		},
-		{
-			Name: "unknown ISD=2, 2-length trail, no trust root in trail",
-			ISD:  2, Trail: []addr.ISD{2, 3},
-			ExpData: nil, ExpError: true,
-		},
-		{
-			Name: "unknown ISD=2, 2-length trail, trust root in trail",
-			ISD:  2, Trail: []addr.ISD{2, 1},
-			ExpData: trcs[2], ExpError: false,
-		},
-		{
-			Name: "unknown ISD=2, 3-length trail, trust root mid-trail ",
-			ISD:  2, Trail: []addr.ISD{2, 1, 3},
-			ExpData: trcs[2], ExpError: false,
-			DBTRCInChecks: []*trc.TRC{trcs[2]},
-		},
-		{
-			Name: "unknown ISD=2, 3-length trail, trust root at end of trail",
-			ISD:  2, Trail: []addr.ISD{2, 3, 1},
-			ExpData: trcs[2], ExpError: false,
-			DBTRCInChecks: []*trc.TRC{trcs[2], trcs[3]},
-		},
-		{
-			Name: "bogus ISD=42, 2-length trail",
-			ISD:  42, Trail: []addr.ISD{42, 1},
-			ExpData: nil, ExpError: true,
+			Name:     "unknown ISD=6",
+			ISD:      6,
+			ExpData:  nil,
+			ExpError: true,
 		},
 	}
 
 	Convey("Get valid TRCs", t, func() {
-		msger := &messenger.MockMessenger{
-			TRCs:   trcs,
-			Chains: chains,
-		}
-		store, cleanF := initStore(t, xtest.MustParseIA("1-ff00:0:1"), msger)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		msger := newMessengerMock(ctrl, trcs, chains)
+		store, cleanF := initStore(t, ctrl, xtest.MustParseIA("1-ff00:0:1"), msger)
 		defer cleanF()
 
 		insertTRC(t, store, trcs[1])
 
 		for _, tc := range testCases {
 			Convey(tc.Name, func() {
-				ctx, cancelF := context.WithTimeout(context.Background(), time.Second)
+				ctx, cancelF := context.WithTimeout(context.Background(), testCtxTimeout)
 				defer cancelF()
 
-				trcObj, err := store.GetValidTRC(ctx, tc.ISD, tc.Trail...)
+				trcObj, err := store.GetValidTRC(ctx, tc.ISD, nil)
 				xtest.SoMsgError("err", err, tc.ExpError)
 				SoMsg("trc", trcObj, ShouldResemble, tc.ExpData)
 
 				// Post-check DB state to verify insertion
 				for _, trcObj := range tc.DBTRCInChecks {
-					get, err := store.trustdb.GetTRCVersion(trcObj.ISD, trcObj.Version)
+					get, err := store.trustdb.GetTRCVersion(ctx, trcObj.ISD, trcObj.Version)
 					SoMsg("db err", err, ShouldBeNil)
 					SoMsg("db trc", get, ShouldResemble, trcObj)
 				}
@@ -202,8 +218,6 @@ func TestGetTRC(t *testing.T) {
 		Version  uint64
 		ExpData  *trc.TRC
 		ExpError bool
-
-		DBTRCNotInChecks []*trc.TRC // Explicitly check that these objects where not saved to DB
 	}{
 		{
 			Name: "bad ISD=0",
@@ -217,7 +231,7 @@ func TestGetTRC(t *testing.T) {
 		},
 		{
 			Name: "local ISD=1, max version",
-			ISD:  1, Version: 0,
+			ISD:  1, Version: scrypto.LatestVer,
 			ExpData: trcs[1], ExpError: false,
 		},
 		{
@@ -229,11 +243,10 @@ func TestGetTRC(t *testing.T) {
 			Name: "unknown ISD=2, version 1",
 			ISD:  2, Version: 1,
 			ExpData: trcs[2], ExpError: false,
-			DBTRCNotInChecks: []*trc.TRC{trcs[2]},
 		},
 		{
 			Name: "unknown ISD=2, max version",
-			ISD:  2, Version: 0,
+			ISD:  2, Version: scrypto.LatestVer,
 			ExpData: trcs[2], ExpError: false,
 		},
 		{
@@ -243,7 +256,7 @@ func TestGetTRC(t *testing.T) {
 		},
 		{
 			Name: "remote ISD=3, max version",
-			ISD:  3, Version: 0,
+			ISD:  3, Version: scrypto.LatestVer,
 			ExpData: trcs[3], ExpError: false,
 		},
 		{
@@ -259,11 +272,10 @@ func TestGetTRC(t *testing.T) {
 	}
 
 	Convey("Get unverified TRCs", t, func() {
-		msger := &messenger.MockMessenger{
-			TRCs:   trcs,
-			Chains: chains,
-		}
-		store, cleanF := initStore(t, xtest.MustParseIA("1-ff00:0:1"), msger)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		msger := newMessengerMock(ctrl, trcs, chains)
+		store, cleanF := initStore(t, ctrl, xtest.MustParseIA("1-ff00:0:1"), msger)
 		defer cleanF()
 
 		insertTRC(t, store, trcs[1])
@@ -271,19 +283,11 @@ func TestGetTRC(t *testing.T) {
 
 		for _, tc := range testCases[4:5] {
 			Convey(tc.Name, func() {
-				ctx, cancelF := context.WithTimeout(context.Background(), time.Second)
+				ctx, cancelF := context.WithTimeout(context.Background(), testCtxTimeout)
 				defer cancelF()
-
 				trcObj, err := store.GetTRC(ctx, tc.ISD, tc.Version)
 				xtest.SoMsgError("err", err, tc.ExpError)
 				SoMsg("trc", trcObj, ShouldResemble, tc.ExpData)
-
-				// Post-check DB state to verify that unverified objects were not inserted
-				for _, trcObj := range tc.DBTRCNotInChecks {
-					get, err := store.trustdb.GetTRCVersion(trcObj.ISD, trcObj.Version)
-					SoMsg("db err", err, ShouldBeNil)
-					SoMsg("db trc", get, ShouldBeNil)
-				}
 			})
 		}
 	})
@@ -296,56 +300,52 @@ func TestGetValidChain(t *testing.T) {
 	testCases := []struct {
 		Name            string
 		IA              addr.IA
-		Trail           []addr.ISD
 		ExpData         *cert.Chain
 		ExpError        bool
 		DBChainInChecks []*cert.Chain // Check that these objects were saved to persistent storage
 	}{
 		{
-			Name: "bad IA=0-1",
-			IA:   xtest.MustParseIA("0-ff00:0:1"), Trail: []addr.ISD{0},
+			Name:    "bad IA=0-1",
+			IA:      xtest.MustParseIA("0-ff00:0:1"),
 			ExpData: nil, ExpError: true,
 		},
 		{
-			Name: "bad IA=1-0",
-			IA:   addr.IA{I: 1, A: 0}, Trail: []addr.ISD{0},
+			Name:    "bad IA=1-0",
+			IA:      addr.IA{I: 1, A: 0},
 			ExpData: nil, ExpError: true,
 		},
 		{
-			Name: "local IA=1-1",
-			IA:   xtest.MustParseIA("1-ff00:0:1"), Trail: []addr.ISD{1},
+			Name:    "local IA=1-1",
+			IA:      xtest.MustParseIA("1-ff00:0:1"),
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:1")], ExpError: false,
 		},
 		{
-			Name: "remote IA=2-4",
-			IA:   xtest.MustParseIA("2-ff00:0:4"), Trail: []addr.ISD{2, 1},
+			Name:    "remote IA=2-4",
+			IA:      xtest.MustParseIA("2-ff00:0:4"),
 			ExpData: chains[xtest.MustParseIA("2-ff00:0:4")], ExpError: false,
 			DBChainInChecks: []*cert.Chain{chains[xtest.MustParseIA("2-ff00:0:4")]},
 		},
 	}
 
 	Convey("Get Chains", t, func() {
-		msger := &messenger.MockMessenger{
-			TRCs:   trcs,
-			Chains: chains,
-		}
-		store, cleanF := initStore(t, xtest.MustParseIA("1-ff00:0:1"), msger)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		msger := newMessengerMock(ctrl, trcs, chains)
+		store, cleanF := initStore(t, ctrl, xtest.MustParseIA("1-ff00:0:1"), msger)
 		defer cleanF()
-
 		insertTRC(t, store, trcs[1])
-
-		for _, tc := range testCases {
+		for _, tc := range testCases[3:4] {
 			Convey(tc.Name, func() {
-				ctx, cancelF := context.WithTimeout(context.Background(), time.Second)
+				ctx, cancelF := context.WithTimeout(context.Background(), testCtxTimeout)
 				defer cancelF()
 
-				chain, err := store.GetValidChain(ctx, tc.IA, tc.Trail...)
+				chain, err := store.GetValidChain(ctx, tc.IA, nil)
 				xtest.SoMsgError("err", err, tc.ExpError)
 				SoMsg("trc", chain, ShouldResemble, tc.ExpData)
 
 				// Post-check DB state to verify insertion
 				for _, chain := range tc.DBChainInChecks {
-					get, err := store.trustdb.GetChainVersion(chain.Leaf.Subject,
+					get, err := store.trustdb.GetChainVersion(ctx, chain.Leaf.Subject,
 						chain.Leaf.Version)
 					SoMsg("db err", err, ShouldBeNil)
 					SoMsg("db chain", get, ShouldResemble, chain)
@@ -362,19 +362,18 @@ func TestGetChain(t *testing.T) {
 		Name               string
 		IA                 addr.IA
 		Version            uint64
-		Trail              []addr.ISD
 		ExpData            *cert.Chain
 		ExpError           bool
 		DBChainNotInChecks []*cert.Chain // Check that these objects were not saved to DB
 	}{
 		{
 			Name: "bad IA=0-1",
-			IA:   xtest.MustParseIA("0-ff00:0:1"), Version: 0,
+			IA:   xtest.MustParseIA("0-ff00:0:1"), Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 		},
 		{
 			Name: "bad IA=1-0",
-			IA:   addr.IA{I: 1, A: 0}, Version: 0,
+			IA:   addr.IA{I: 1, A: 0}, Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 		},
 		{
@@ -384,7 +383,7 @@ func TestGetChain(t *testing.T) {
 		},
 		{
 			Name: "local IA=1-1, max version",
-			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:1")], ExpError: false,
 		},
 		{
@@ -404,7 +403,7 @@ func TestGetChain(t *testing.T) {
 		},
 		{
 			Name: "remote IA=3-9, max version",
-			IA:   xtest.MustParseIA("3-ff00:0:9"), Version: 0,
+			IA:   xtest.MustParseIA("3-ff00:0:9"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("3-ff00:0:9")], ExpError: false,
 		},
 		{
@@ -420,11 +419,10 @@ func TestGetChain(t *testing.T) {
 	}
 
 	Convey("Get unverified chains", t, func() {
-		msger := &messenger.MockMessenger{
-			TRCs:   trcs,
-			Chains: chains,
-		}
-		store, cleanF := initStore(t, xtest.MustParseIA("1-ff00:0:1"), msger)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		msger := newMessengerMock(ctrl, trcs, chains)
+		store, cleanF := initStore(t, ctrl, xtest.MustParseIA("1-ff00:0:1"), msger)
 		defer cleanF()
 
 		insertTRC(t, store, trcs[1])
@@ -434,7 +432,7 @@ func TestGetChain(t *testing.T) {
 
 		for _, tc := range testCases {
 			Convey(tc.Name, func() {
-				ctx, cancelF := context.WithTimeout(context.Background(), time.Second)
+				ctx, cancelF := context.WithTimeout(context.Background(), testCtxTimeout)
 				defer cancelF()
 
 				chain, err := store.GetChain(ctx, tc.IA, tc.Version)
@@ -443,7 +441,7 @@ func TestGetChain(t *testing.T) {
 
 				// Post-check DB state to verify that unverified objects were not inserted
 				for _, chain := range tc.DBChainNotInChecks {
-					get, err := store.trustdb.GetChainVersion(chain.Leaf.Subject,
+					get, err := store.trustdb.GetChainVersion(ctx, chain.Leaf.Subject,
 						chain.Leaf.Version)
 					SoMsg("db err", err, ShouldBeNil)
 					SoMsg("db chain", get, ShouldBeNil)
@@ -467,25 +465,25 @@ func TestTRCReqHandler(t *testing.T) {
 	}{
 		{
 			Name: "ask for known isd=1, version=max, cache-only, recursive",
-			ISD:  1, Version: 0,
+			ISD:  1, Version: scrypto.LatestVer,
 			ExpData: trcs[1], ExpError: false,
 			RecursionEnabled: true, CacheOnly: true,
 		},
 		{
 			Name: "ask for known isd=1, version=max, cache-only, non-recursive",
-			ISD:  1, Version: 0,
+			ISD:  1, Version: scrypto.LatestVer,
 			ExpData: trcs[1], ExpError: false,
 			RecursionEnabled: false, CacheOnly: true,
 		},
 		{
 			Name: "ask for known isd=1, version=max, cache-only=false, recursive",
-			ISD:  1, Version: 0,
+			ISD:  1, Version: scrypto.LatestVer,
 			ExpData: trcs[1], ExpError: false,
 			RecursionEnabled: true, CacheOnly: false,
 		},
 		{
 			Name: "ask for known isd=1, version=max, cache-only=false, non-recursive",
-			ISD:  1, Version: 0,
+			ISD:  1, Version: scrypto.LatestVer,
 			ExpData: trcs[1], ExpError: false,
 			RecursionEnabled: false, CacheOnly: false,
 		},
@@ -503,37 +501,37 @@ func TestTRCReqHandler(t *testing.T) {
 		},
 		{
 			Name: "ask for unknown isd=2, version=max, cache-only, recursive",
-			ISD:  2, Version: 0,
+			ISD:  2, Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: true, CacheOnly: true,
 		},
 		{
 			Name: "ask for unknown isd=2, version=max, cache-only, non-recursive",
-			ISD:  2, Version: 0,
+			ISD:  2, Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: false, CacheOnly: true,
 		},
 		{
 			Name: "ask for unknown isd=2, version=max, cache-only=false, recursive",
-			ISD:  2, Version: 0,
+			ISD:  2, Version: scrypto.LatestVer,
 			ExpData: trcs[2], ExpError: false,
 			RecursionEnabled: true, CacheOnly: false,
 		},
 		{
 			Name: "ask for known isd=2, version=max, cache-only=false, non-recursive",
-			ISD:  2, Version: 0,
+			ISD:  2, Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: false, CacheOnly: false,
 		},
 		{
 			Name: "ask for bogus isd=42, version=max, cache-only=false, recursive",
-			ISD:  42, Version: 0,
+			ISD:  42, Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: true, CacheOnly: false,
 		},
 		{
 			Name: "ask for bogus isd=42, version=max, cache-only=true, non-recursive",
-			ISD:  42, Version: 0,
+			ISD:  42, Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: false, CacheOnly: true,
 		},
@@ -551,29 +549,31 @@ func TestTRCReqHandler(t *testing.T) {
 	//
 	// ClientMsger runs without a trust store.
 	Convey("Test TRCReq Handler", t, func() {
-		msger := &messenger.MockMessenger{
-			TRCs:   trcs,
-			Chains: chains,
-		}
-		store, cleanF := initStore(t, xtest.MustParseIA("1-ff00:0:1"), msger)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		msger := newMessengerMock(ctrl, trcs, chains)
+		store, cleanF := initStore(t, ctrl, xtest.MustParseIA("1-ff00:0:1"), msger)
 		defer cleanF()
 
 		insertTRC(t, store, trcs[1])
 
 		c2s, s2c := p2p.New()
 		// each test initiates a request from the client messenger
-		clientMessenger := setupMessenger(c2s, nil, "client")
+		clientMessenger := setupMessenger(xtest.MustParseIA("2-ff00:0:1"), c2s, nil, "client")
 		// the server messenger runs ListenAndServe, backed by the trust store
-		serverMessenger := setupMessenger(s2c, store, "server")
+		serverMessenger := setupMessenger(xtest.MustParseIA("1-ff00:0:1"), s2c, store, "server")
 
 		for _, tc := range testCases {
 			Convey(tc.Name, func() {
 				handler := store.NewTRCReqHandler(tc.RecursionEnabled)
-				serverMessenger.AddHandler(messenger.TRCRequest, handler)
-				go serverMessenger.ListenAndServe()
+				serverMessenger.AddHandler(infra.TRCRequest, handler)
+				go func() {
+					defer log.LogPanicAndExit()
+					serverMessenger.ListenAndServe()
+				}()
 				defer serverMessenger.CloseServer()
 
-				ctx, cancelF := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				ctx, cancelF := context.WithTimeout(context.Background(), testCtxTimeout)
 				defer cancelF()
 
 				msg := &cert_mgmt.TRCReq{
@@ -607,25 +607,25 @@ func TestChainReqHandler(t *testing.T) {
 	}{
 		{
 			Name: "ask for known chain=1-1, version=max, cache-only, recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:1")], ExpError: false,
 			RecursionEnabled: true, CacheOnly: true,
 		},
 		{
 			Name: "ask for known chain=1-1, version=max, cache-only, non-recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:1")], ExpError: false,
 			RecursionEnabled: false, CacheOnly: true,
 		},
 		{
 			Name: "ask for known chain=1-1, version=max, cache-only=false, recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:1")], ExpError: false,
 			RecursionEnabled: true, CacheOnly: false,
 		},
 		{
 			Name: "ask for known chain=1-1, version=max, cache-only=false, non-recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:1"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:1")], ExpError: false,
 			RecursionEnabled: false, CacheOnly: false,
 		},
@@ -643,25 +643,25 @@ func TestChainReqHandler(t *testing.T) {
 		},
 		{
 			Name: "ask for unknown chain=1-2, version=max, cache-only, recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: true, CacheOnly: true,
 		},
 		{
 			Name: "ask for unknown chain=1-2, version=max, cache-only, non-recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: false, CacheOnly: true,
 		},
 		{
 			Name: "ask for unknown chain=1-2, version=max, cache-only=false, recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: scrypto.LatestVer,
 			ExpData: chains[xtest.MustParseIA("1-ff00:0:2")], ExpError: false,
 			RecursionEnabled: true, CacheOnly: false,
 		},
 		{
 			Name: "ask for unknown chain=1-2, version=max, cache-only=false, non-recursive",
-			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: 0,
+			IA:   xtest.MustParseIA("1-ff00:0:2"), Version: scrypto.LatestVer,
 			ExpData: nil, ExpError: true,
 			RecursionEnabled: false, CacheOnly: false,
 		},
@@ -669,11 +669,10 @@ func TestChainReqHandler(t *testing.T) {
 
 	// See TestTRCReqHandler for info about the testing setup.
 	Convey("Test ChainReq Handler", t, func() {
-		msger := &messenger.MockMessenger{
-			TRCs:   trcs,
-			Chains: chains,
-		}
-		store, cleanF := initStore(t, xtest.MustParseIA("1-ff00:0:1"), msger)
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		msger := newMessengerMock(ctrl, trcs, chains)
+		store, cleanF := initStore(t, ctrl, xtest.MustParseIA("1-ff00:0:1"), msger)
 		defer cleanF()
 
 		insertTRC(t, store, trcs[1])
@@ -681,18 +680,21 @@ func TestChainReqHandler(t *testing.T) {
 
 		c2s, s2c := p2p.New()
 		// each test initiates a request from the client messenger
-		clientMessenger := setupMessenger(c2s, nil, "client")
+		clientMessenger := setupMessenger(xtest.MustParseIA("2-ff00:0:1"), c2s, nil, "client")
 		// the server messenger runs ListenAndServe, backed by the trust store
-		serverMessenger := setupMessenger(s2c, store, "server")
+		serverMessenger := setupMessenger(xtest.MustParseIA("1-ff00:0:1"), s2c, store, "server")
 
 		for _, tc := range testCases {
 			Convey(tc.Name, func() {
 				handler := store.NewChainReqHandler(tc.RecursionEnabled)
-				serverMessenger.AddHandler(messenger.ChainRequest, handler)
-				go serverMessenger.ListenAndServe()
+				serverMessenger.AddHandler(infra.ChainRequest, handler)
+				go func() {
+					defer log.LogPanicAndExit()
+					serverMessenger.ListenAndServe()
+				}()
 				defer serverMessenger.CloseServer()
 
-				ctx, cancelF := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				ctx, cancelF := context.WithTimeout(context.Background(), testCtxTimeout)
 				defer cancelF()
 
 				msg := &cert_mgmt.ChainReq{
@@ -712,10 +714,11 @@ func TestChainReqHandler(t *testing.T) {
 	})
 }
 
-func setupMessenger(conn net.PacketConn, store *Store, name string) infra.Messenger {
+func setupMessenger(ia addr.IA, conn net.PacketConn, store *Store, name string) infra.Messenger {
 	transport := rpt.New(conn, log.New("name", name))
 	dispatcher := disp.New(transport, messenger.DefaultAdapter, log.New("name", name))
-	return messenger.New(dispatcher, store, log.Root().New("name", name))
+	config := &messenger.Config{DisableSignatureVerification: true}
+	return messenger.New(ia, dispatcher, store, log.Root().New("name", name), config)
 }
 
 func loadCrypto(t *testing.T, isds []addr.ISD,
@@ -727,17 +730,13 @@ func loadCrypto(t *testing.T, isds []addr.ISD,
 	trcMap := make(map[addr.ISD]*trc.TRC)
 	for _, isd := range isds {
 		trcMap[isd], err = trc.TRCFromFile(getTRCFileName(isd, 1), false)
-		if err != nil {
-			t.Fatal(err)
-		}
+		xtest.FailOnErr(t, err)
 	}
 
 	chainMap := make(map[addr.IA]*cert.Chain)
 	for _, ia := range ias {
 		chainMap[ia], err = cert.ChainFromFile(getChainFileName(ia, 1), false)
-		if err != nil {
-			t.Fatal(err)
-		}
+		xtest.FailOnErr(t, err)
 	}
 	return trcMap, chainMap
 }
@@ -751,42 +750,33 @@ func getChainFileName(ia addr.IA, version uint64) string {
 		tmpDir, ia.I, ia.A.FileFmt(), ia.I, ia.A.FileFmt(), version)
 }
 
-func initStore(t *testing.T, ia addr.IA, msger infra.Messenger) (*Store, func()) {
+func initStore(t *testing.T, ctrl *gomock.Controller,
+	ia addr.IA, msger infra.Messenger) (*Store, func() error) {
+
 	t.Helper()
-
-	dbFile := xtest.MustTempFileName("", "truststore-test")
-	db, err := trustdb.New(dbFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	store, err := NewStore(db, ia, 0, log.Root())
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	db, err := trustdbsqlite.New(":memory:")
+	xtest.FailOnErr(t, err)
+	topo := topology.NewTopo()
+	topotestutil.AddServer(topo, proto.ServiceType_cs, "foo",
+		topology.TestTopoAddr(nil, nil, nil, nil))
+	itopo.SetCurrentTopology(topo)
+	store, err := NewStore(db, ia, &Config{}, log.Root())
+	xtest.FailOnErr(t, err)
 	// Enable fake network access for trust database
 	store.SetMessenger(msger)
-	return store, func() {
-		db.Close()
-		os.Remove(dbFile)
-	}
+	return store, db.Close
 }
 
 func insertTRC(t *testing.T, store *Store, trcObj *trc.TRC) {
 	t.Helper()
 
-	_, err := store.trustdb.InsertTRC(trcObj)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err := store.trustdb.InsertTRC(context.Background(), trcObj)
+	xtest.FailOnErr(t, err)
 }
 
 func insertChain(t *testing.T, store *Store, chain *cert.Chain) {
 	t.Helper()
 
-	_, err := store.trustdb.InsertChain(chain)
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, err := store.trustdb.InsertChain(context.Background(), chain)
+	xtest.FailOnErr(t, err)
 }

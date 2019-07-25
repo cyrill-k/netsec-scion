@@ -32,7 +32,6 @@ from lib.defines import (
     GEN_CACHE_PATH,
     MIN_REVOCATION_TTL,
     PATH_REQ_TOUT,
-    PATH_SERVICE,
 )
 from lib.errors import SCIONBaseError
 from lib.log import add_formatter, Rfc3339Formatter
@@ -54,6 +53,7 @@ from lib.types import (
     PathMgmtType as PMT,
     PathSegmentType as PST,
     PayloadClass,
+    ServiceType,
 )
 from lib.util import SCIONTime, sleep_interval
 from lib.zk.cache import ZkSharedCache
@@ -76,7 +76,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
     """
     The SCION Path Server.
     """
-    SERVICE_TYPE = PATH_SERVICE
+    SERVICE_TYPE = ServiceType.PS
     MAX_SEG_NO = 5  # TODO: replace by config variable.
     # ZK path for incoming PATHs
     ZK_PATH_CACHE_PATH = "path_cache"
@@ -91,14 +91,16 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
     # TTL of segments in the queue for ZK (in seconds)
     SEGS_TO_ZK_TTL = 10 * 60
 
-    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH, prom_export=None):
+    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH,
+                 prom_export=None, sciond_path=None):
         """
         :param str server_id: server identifier.
         :param str conf_dir: configuration directory.
         :param str prom_export: prometheus export address.
+        :param str sciond_path: path to sciond socket.
         """
         super().__init__(server_id, conf_dir, spki_cache_dir=spki_cache_dir,
-                         prom_export=prom_export)
+                         prom_export=prom_export, sciond_path=sciond_path)
         self.config = self._load_as_conf()
         down_labels = {**self._labels, "type": "down"} if self._labels else None
         core_labels = {**self._labels, "type": "core"} if self._labels else None
@@ -138,7 +140,7 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         self._revs_to_zk = ExpiringDict(1000, MIN_REVOCATION_TTL)
         self._zkid = ZkID.from_values(self.addr.isd_as, self.id,
                                       [(self.addr.host, self._port)])
-        self.zk = Zookeeper(self.topology.isd_as, PATH_SERVICE,
+        self.zk = Zookeeper(self.topology.isd_as, self.SERVICE_TYPE,
                             self._zkid.copy().pack(), self.topology.zookeepers)
         self.zk.retry("Joining party", self.zk.party_setup)
         self.path_cache = ZkSharedCache(self.zk, self.ZK_PATH_CACHE_PATH,
@@ -184,13 +186,8 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         for raw in raw_entries:
             srev_info = SignedRevInfo.from_raw(raw)
             rev_info = srev_info.rev_info()
-            try:
-                self.check_revocation(srev_info)
-            except SCIONBaseError as e:
-                logging.error("Revocation check from zookeeper failed for %s:\n%s",
-                              srev_info.short_desc(), e)
-                continue
-            self._remove_revoked_segments(rev_info)
+            self.check_revocation(srev_info, lambda x:
+                                  self._remove_revoked_segments(rev_info) if not x else False)
 
     @abstractmethod
     def _handle_up_segment_record(self, pcb, **kwargs):
@@ -251,21 +248,14 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
         if srev_info in self.revocations:
             return
         logging.debug("Received revocation from %s: %s", meta, rev_info.short_desc())
-        try:
-            self.check_revocation(srev_info)
-        except SCIONBaseError as e:
-            logging.error("Revocation check failed for %s from %s:\n%s",
-                          srev_info.short_desc(), meta, e)
-            return
+        self.check_revocation(srev_info, lambda x: self._continue_revocation_processing(meta,
+                              srev_info) if not x else False, meta)
 
-        if meta.ia[0] != self.addr.isd_as[0]:
-            logging.info("Dropping revocation received from a different ISD. Src: %s RevInfo: %s" %
-                         (meta, rev_info.short_desc()))
-            return
+    def _continue_revocation_processing(self, meta, srev_info):
         self.revocations.add(srev_info)
         self._revs_to_zk[srev_info] = srev_info.copy().pack()  # have to pack copy
         # Remove segments that contain the revoked interface.
-        self._remove_revoked_segments(rev_info)
+        self._remove_revoked_segments(srev_info.rev_info())
         # Forward revocation to other path servers.
         self._forward_revocation(srev_info, meta)
 

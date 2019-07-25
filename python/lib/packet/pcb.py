@@ -1,4 +1,5 @@
 # Copyright 2014 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -171,11 +172,12 @@ class PathSegment(Cerealizable):
         if idx is None:
             idx = len(self.p.asEntries) - 1
         b = [self.p.sdata]
-        for i in range(idx+1):
+        for i in range(idx):
             sblob = self.p.asEntries[i]
             b.append(sblob.blob)
             ssign = ProtoSign(sblob.sign)
-            b.append(ssign.sig_pack(i != idx))
+            b.append(ssign.sig_pack())
+        b.append(self.p.asEntries[idx].blob)
         return b"".join(b)
 
     def add_asm(self, asm, sig_type=ProtoSignType.NONE, sig_src=b""):  # pragma: no cover
@@ -266,7 +268,7 @@ class PathSegment(Cerealizable):
         (XXX(kormat): not currently implemented).
         Otherwise fall-back to the standard expiration time calculation.
         """
-        return self.infoF().timestamp + int(self._min_exp * EXP_TIME_UNIT)
+        return self.infoF().timestamp + int((self._min_exp + 1) * EXP_TIME_UNIT)
 
     def short_id(self):  # pragma: no cover
         """

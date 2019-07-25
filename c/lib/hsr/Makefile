@@ -49,6 +49,10 @@ SRCS-y := hsr_dpdk.c
 CFLAGS += -O3 -I$(S)/.. -I$(S)/../scion -Wall -fno-strict-aliasing -g
 #CFLAGS += $(WERROR_FLAGS)
 
+ifeq ($(D),1)
+CFLAGS += -gdwarf-2 -O0
+endif
+
 EXTRA_LDFLAGS += -lscion -lrte_lpm
 
 include $(RTE_SDK)/mk/rte.extshared.mk
@@ -59,11 +63,13 @@ doinstall: .installstamp
 PREFIX ?= /usr/local
 build/$(SHARED): $(SHARED)
 .installstamp: build/$(SHARED)
+	@sudo -p "c/lib/hsr:install [sudo] password for %p: " true
 	sudo cp build/$(SHARED) $(PREFIX)/lib/
 	sudo ldconfig
 	touch .installstamp
 
 uninstall:
+	@sudo -p "c/lib/hsr:uninstall [sudo] password for %p: " true
 	sudo rm -r $(PREFIX)/lib/$(SHARED)
 	sudo ldconfig
 	rm -f .installstamp

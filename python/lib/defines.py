@@ -77,26 +77,8 @@ DISPATCHER_DIR = "/run/shm/dispatcher"
 DEFAULT_DISPATCHER_ID = "default"
 #: Default SCION daemon UNIX socket directory
 SCIOND_API_SOCKDIR = "/run/shm/sciond/"
-#: Environment variable to specify the SCION daemon API address
-SCIOND_API_PATH_ENV_VAR = "SCIOND_PATH"
 #: Default SCION daemon API UNIX socket
 SCIOND_API_DEFAULT_SOCK = "default.sock"
-
-BEACON_SERVICE = "bs"
-CERTIFICATE_SERVICE = "cs"
-DNS_SERVICE = "ds"
-PATH_SERVICE = "ps"
-ROUTER_SERVICE = "br"
-SIBRA_SERVICE = "sb"
-#: All the service types
-SERVICE_TYPES = (
-    BEACON_SERVICE,
-    CERTIFICATE_SERVICE,
-    DNS_SERVICE,
-    PATH_SERVICE,
-    ROUTER_SERVICE,
-    SIBRA_SERVICE,
-)
 
 #: Dispatcher registration timeout
 DISPATCHER_TIMEOUT = 60.0
@@ -134,11 +116,7 @@ MAX_HOST_ADDR_LEN = 16
 
 # Minimum revocation TTL in seconds
 MIN_REVOCATION_TTL = 20
-
-# TCP polling timeouts, used by accept() and recv().
-TCP_ACCEPT_POLLING_TOUT = 1.0
-# SCION control-plane TCP connection timeout.
-TCP_TIMEOUT = 5.0
+REVOCATION_GRACE = 1
 
 # Max time for a path lookup to succeed/fail.
 PATH_REQ_TOUT = 2

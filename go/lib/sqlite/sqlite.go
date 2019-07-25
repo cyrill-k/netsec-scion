@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,62 +25,91 @@ import (
 // no database exists a new database is be created. If the schema version of the
 // stored database is different from schemaVersion, an error is returned.
 func New(path string, schema string, schemaVersion int) (*sql.DB, error) {
+	var err error
+	if path == "" {
+		return nil, common.NewBasicError("Empty path not allowed for sqlite", nil)
+	}
 	db, err := open(path)
 	if err != nil {
 		return nil, err
+	}
+	// On future errors, close the sql database before exiting
+	defer func() {
+		if err != nil {
+			db.Close()
+		}
+	}()
+	// prevent weird errors. (see https://stackoverflow.com/a/35805826)
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return nil, common.NewBasicError("Unable to set WAL journal mode", err,
+			"path", path)
 	}
 	// Check the schema version and set up new DB if necessary.
 	var existingVersion int
 	err = db.QueryRow("PRAGMA user_version;").Scan(&existingVersion)
 	if err != nil {
-		return nil, common.NewBasicError("Failed to check schema version", err)
+		return nil, common.NewBasicError("Failed to check schema version", err,
+			"path", path)
 	}
 	if existingVersion == 0 {
-		if err := setup(db, schema, schemaVersion); err != nil {
+		if err = setup(db, schema, schemaVersion, path); err != nil {
 			return nil, err
 		}
 	} else if existingVersion != schemaVersion {
 		return nil, common.NewBasicError("Database schema version mismatch", nil,
-			"expected", schemaVersion, "have", existingVersion)
+			"expected", schemaVersion, "have", existingVersion, "path", path)
 	}
 	return db, nil
 }
 
 func open(path string) (*sql.DB, error) {
+	var err error
 	// Add foreign_key parameter to path to enable foreign key support.
 	uri := fmt.Sprintf("%s?_foreign_keys=1", path)
-	var err error
 	db, err := sql.Open("sqlite3", uri)
 	if err != nil {
-		return nil, common.NewBasicError("Couldn't open SQLite database", err)
+		return nil, common.NewBasicError("Couldn't open SQLite database", err, "path", path)
+	}
+	// On future errors, close the sql database before exiting
+	defer func() {
+		if err != nil {
+			db.Close()
+		}
+	}()
+	// Make sure DB is reachable
+	if err = db.Ping(); err != nil {
+		return nil, common.NewBasicError("Initial DB ping failed, connection broken?", err,
+			"path", path)
 	}
 	// Ensure foreign keys are supported and enabled.
 	var enabled bool
 	err = db.QueryRow("PRAGMA foreign_keys;").Scan(&enabled)
 	if err == sql.ErrNoRows {
-		return nil, common.NewBasicError("Foreign keys not supported", err)
+		return nil, common.NewBasicError("Foreign keys not supported", err,
+			"path", path)
 	}
 	if err != nil {
-		return nil, common.NewBasicError("Failed to check for foreign key support", err)
+		return nil, common.NewBasicError("Failed to check for foreign key support", err,
+			"path", path)
 	}
 	if !enabled {
-		return nil, common.NewBasicError("Failed to enable foreign key support", nil)
+		db.Close()
+		return nil, common.NewBasicError("Failed to enable foreign key support", nil,
+			"path", path)
 	}
 	return db, nil
 }
 
-func setup(db *sql.DB, schema string, schemaVersion int) error {
-	if db == nil {
-		return common.NewBasicError("No database open", nil)
-	}
+func setup(db *sql.DB, schema string, schemaVersion int, path string) error {
 	_, err := db.Exec(schema)
 	if err != nil {
-		return common.NewBasicError("Failed to set up SQLite database", err)
+		return common.NewBasicError("Failed to set up SQLite database", err, "path", path)
 	}
 	// Write schema version to database.
 	_, err = db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion))
 	if err != nil {
-		return common.NewBasicError("Failed to write schema version", err)
+		return common.NewBasicError("Failed to write schema version", err, "path", path)
 	}
 	return nil
 }

@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +20,14 @@ import (
 	"io"
 	"time"
 
-	"github.com/scionproto/scion/go/lib/addr"
-
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/log"
 	"github.com/scionproto/scion/go/lib/ringbuf"
 	"github.com/scionproto/scion/go/lib/snet"
+	"github.com/scionproto/scion/go/lib/sock/reliable"
 	"github.com/scionproto/scion/go/sig/metrics"
 	"github.com/scionproto/scion/go/sig/mgmt"
 	"github.com/scionproto/scion/go/sig/sigcmn"
@@ -42,7 +43,7 @@ const (
 )
 
 var (
-	extConn            *snet.Conn
+	extConn            snet.Conn
 	tunIO              io.ReadWriteCloser
 	freeFrames         *ringbuf.Ring
 	framesRecvCounters map[metrics.CtrPairKey]metrics.CtrPair
@@ -56,17 +57,16 @@ type Dispatcher struct {
 	workers map[string]*Worker
 }
 
-func Init(tio io.ReadWriteCloser) error {
+func NewDispatcher(tio io.ReadWriteCloser) *Dispatcher {
 	tunIO = tio
 	freeFrames = ringbuf.New(freeFramesCap, func() interface{} {
 		return NewFrameBuf()
 	}, "ingress", prometheus.Labels{"ringId": "freeFrames", "sessId": ""})
 	framesRecvCounters = make(map[metrics.CtrPairKey]metrics.CtrPair)
-	d := &Dispatcher{
+	return &Dispatcher{
 		laddr:   sigcmn.EncapSnetAddr(),
 		workers: make(map[string]*Worker),
 	}
-	return d.Run()
 }
 
 func (d *Dispatcher) Run() error {
@@ -75,11 +75,10 @@ func (d *Dispatcher) Run() error {
 	if err != nil {
 		return common.NewBasicError("Unable to initialize extConn", err)
 	}
-	d.read()
-	return nil
+	return d.read()
 }
 
-func (d *Dispatcher) read() {
+func (d *Dispatcher) read() error {
 	frames := make(ringbuf.EntryList, 64)
 	lastCleanup := time.Now()
 	for {
@@ -89,6 +88,9 @@ func (d *Dispatcher) read() {
 			read, src, err := extConn.ReadFromSCION(frame.raw)
 			if err != nil {
 				log.Error("IngressDispatcher: Unable to read from external ingress", "err", err)
+				if reliable.IsDispatcherError(err) {
+					return common.NewBasicError("Problems speaking to dispatcher", err)
+				}
 				frame.Release()
 			} else {
 				frame.frameLen = read
@@ -115,7 +117,10 @@ func (d *Dispatcher) dispatch(frame *FrameBuf, src *snet.Addr) {
 	if !ok {
 		worker = NewWorker(src, frame.sessId)
 		d.workers[dispatchStr] = worker
-		go worker.Run()
+		go func() {
+			defer log.LogPanicAndExit()
+			worker.Run()
+		}()
 	}
 	worker.markedForCleanup = false
 	worker.Ring.Write(ringbuf.EntryList{frame}, true)
@@ -123,10 +128,14 @@ func (d *Dispatcher) dispatch(frame *FrameBuf, src *snet.Addr) {
 
 // cleanup periodically stops and releases idle workers.
 func (d *Dispatcher) cleanup() {
-	for key, worker := range d.workers {
+	for key := range d.workers {
+		worker := d.workers[key]
 		if worker.markedForCleanup {
 			delete(d.workers, key)
-			go worker.Stop()
+			go func() {
+				defer log.LogPanicAndExit()
+				worker.Stop()
+			}()
 		} else {
 			worker.markedForCleanup = true
 		}

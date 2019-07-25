@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,12 +17,17 @@ package sciond
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/path_mgmt"
+	"github.com/scionproto/scion/go/lib/log"
+	"github.com/scionproto/scion/go/lib/overlay"
+	"github.com/scionproto/scion/go/lib/topology"
 	"github.com/scionproto/scion/go/lib/util"
 	"github.com/scionproto/scion/go/proto"
 )
@@ -33,6 +39,8 @@ const (
 	ErrorNoPaths
 	ErrorPSTimeout
 	ErrorInternal
+	ErrorBadSrcIA
+	ErrorBadDstIA
 )
 
 func (c PathErrorCode) String() string {
@@ -55,16 +63,16 @@ var _ proto.Cerealizable = (*Pld)(nil)
 type Pld struct {
 	Id                 uint64
 	Which              proto.SCIONDMsg_Which
-	PathReq            PathReq
-	PathReply          PathReply
-	AsInfoReq          ASInfoReq
-	AsInfoReply        ASInfoReply
-	RevNotification    RevNotification
-	RevReply           RevReply
-	IfInfoRequest      IFInfoRequest
-	IfInfoReply        IFInfoReply
-	ServiceInfoRequest ServiceInfoRequest
-	ServiceInfoReply   ServiceInfoReply
+	PathReq            *PathReq
+	PathReply          *PathReply
+	AsInfoReq          *ASInfoReq
+	AsInfoReply        *ASInfoReply
+	RevNotification    *RevNotification
+	RevReply           *RevReply
+	IfInfoRequest      *IFInfoRequest
+	IfInfoReply        *IFInfoReply
+	ServiceInfoRequest *ServiceInfoRequest
+	ServiceInfoReply   *ServiceInfoReply
 }
 
 func NewPldFromRaw(b common.RawBytes) (*Pld, error) {
@@ -120,9 +128,22 @@ type PathReq struct {
 	Flags    PathReqFlags
 }
 
+func (pathReq *PathReq) Copy() *PathReq {
+	return &PathReq{
+		Dst:      pathReq.Dst,
+		Src:      pathReq.Src,
+		MaxPaths: pathReq.MaxPaths,
+		Flags:    pathReq.Flags,
+	}
+}
+
+func (pathReq *PathReq) String() string {
+	return fmt.Sprintf("%v -> %v, maxPaths=%d, flags=%v",
+		pathReq.Src, pathReq.Dst, pathReq.MaxPaths, pathReq.Flags)
+}
+
 type PathReqFlags struct {
-	Flush bool
-	Sibra bool
+	Refresh bool
 }
 
 type PathReply struct {
@@ -130,9 +151,21 @@ type PathReply struct {
 	Entries   []PathReplyEntry
 }
 
+func (r *PathReply) String() string {
+	strEntries := make([]string, len(r.Entries))
+	for i := range r.Entries {
+		strEntries[i] = r.Entries[i].String()
+	}
+	return fmt.Sprintf("ErrorCode=%v\n  %v", r.ErrorCode, strings.Join(strEntries, "\n  "))
+}
+
 type PathReplyEntry struct {
 	Path     *FwdPathMeta
 	HostInfo HostInfo
+}
+
+func (e *PathReplyEntry) String() string {
+	return fmt.Sprintf("%v NextHop=%v", e.Path, &e.HostInfo)
 }
 
 type HostInfo struct {
@@ -153,6 +186,18 @@ func HostInfoFromHostAddr(host addr.HostAddr, port uint16) *HostInfo {
 	return h
 }
 
+func HostInfoFromTopoAddr(topoAddr topology.TopoAddr) HostInfo {
+	ipv4, port4 := topoAddrToIPv4AndPort(topoAddr)
+	ipv6, port6 := topoAddrToIPv6AndPort(topoAddr)
+	return buildHostInfo(ipv4, ipv6, port4, port6)
+}
+
+func HostInfoFromTopoBRAddr(topoBRAddr topology.TopoBRAddr) HostInfo {
+	ipv4, port4 := topoBRAddrToIPv4AndPort(topoBRAddr)
+	ipv6, port6 := topoBRAddrToIPv6AndPort(topoBRAddr)
+	return buildHostInfo(ipv4, ipv6, port4, port6)
+}
+
 func (h *HostInfo) Host() addr.HostAddr {
 	if len(h.Addrs.Ipv4) > 0 {
 		return addr.HostIPv4(h.Addrs.Ipv4)
@@ -161,6 +206,76 @@ func (h *HostInfo) Host() addr.HostAddr {
 		return addr.HostIPv6(h.Addrs.Ipv6)
 	}
 	return nil
+}
+
+func (h *HostInfo) Overlay() (*overlay.OverlayAddr, error) {
+	var l4 addr.L4Info
+	if h.Port != 0 {
+		l4 = addr.NewL4UDPInfo(h.Port)
+	}
+	return overlay.NewOverlayAddr(h.Host(), l4)
+}
+
+func (h *HostInfo) String() string {
+	return fmt.Sprintf("[%v]:%d", h.Host(), h.Port)
+}
+
+func topoAddrToIPv4AndPort(topoAddr topology.TopoAddr) (net.IP, uint16) {
+	var ip net.IP
+	var port uint16
+	if pubAddr := topoAddr.PublicAddr(overlay.IPv4); pubAddr != nil {
+		ip = pubAddr.L3.IP()
+		port = pubAddr.L4.Port()
+	}
+	return ip, port
+}
+
+func topoAddrToIPv6AndPort(topoAddr topology.TopoAddr) (net.IP, uint16) {
+	if pubAddr := topoAddr.PublicAddr(overlay.IPv6); pubAddr != nil {
+		return pubAddr.L3.IP(), pubAddr.L4.Port()
+	}
+	return nil, 0
+}
+
+func topoBRAddrToIPv4AndPort(topoBRAddr topology.TopoBRAddr) (net.IP, uint16) {
+	if topoBRAddr.IPv4 != nil {
+		if v4Addr := topoBRAddr.IPv4.PublicOverlay; v4Addr != nil {
+			return v4Addr.L3().IP(), v4Addr.L4().Port()
+		}
+	}
+	return nil, 0
+}
+
+func topoBRAddrToIPv6AndPort(topoBRAddr topology.TopoBRAddr) (net.IP, uint16) {
+	if topoBRAddr.IPv6 != nil {
+		if v6Addr := topoBRAddr.IPv6.PublicOverlay; v6Addr != nil {
+			return v6Addr.L3().IP(), v6Addr.L4().Port()
+		}
+	}
+	return nil, 0
+}
+
+func buildHostInfo(ipv4, ipv6 net.IP, port4, port6 uint16) HostInfo {
+	if port4 != 0 && port6 != 0 && port4 != port6 {
+		// NOTE: https://github.com/scionproto/scion/issues/1842 will change
+		// the behavior of this.
+		log.Warn("port mismatch", "port4", port4, "port6", port6)
+	}
+	// XXX This assumes that Ipv4 and IPv6 use the same port!
+	port := port4
+	if port == 0 {
+		port = port6
+	}
+	return HostInfo{
+		Addrs: struct {
+			Ipv4 []byte
+			Ipv6 []byte
+		}{
+			Ipv4: ipv4,
+			Ipv6: ipv6,
+		},
+		Port: port,
+	}
 }
 
 type FwdPathMeta struct {
@@ -187,7 +302,7 @@ func (fpm *FwdPathMeta) DstIA() addr.IA {
 }
 
 func (fpm *FwdPathMeta) Expiry() time.Time {
-	return util.USecsToTime(uint64(fpm.ExpTime))
+	return util.SecsToTime(fpm.ExpTime)
 }
 
 func (fpm *FwdPathMeta) String() string {
@@ -217,8 +332,35 @@ type PathInterface struct {
 	IfID     common.IFIDType
 }
 
+func NewPathInterface(str string) (PathInterface, error) {
+	tokens := strings.Split(str, "#")
+	if len(tokens) != 2 {
+		return PathInterface{},
+			common.NewBasicError("Failed to parse interface spec", nil, "value", str)
+	}
+	var iface PathInterface
+	ia, err := addr.IAFromString(tokens[0])
+	if err != nil {
+		return PathInterface{}, err
+	}
+	iface.RawIsdas = ia.IAInt()
+	ifid, err := strconv.ParseUint(tokens[1], 10, 64)
+	if err != nil {
+		return PathInterface{}, err
+	}
+	iface.IfID = common.IFIDType(ifid)
+	return iface, nil
+}
+
 func (iface *PathInterface) ISD_AS() addr.IA {
 	return iface.RawIsdas.IA()
+}
+
+func (iface *PathInterface) Eq(other *PathInterface) bool {
+	if iface == nil || other == nil {
+		return iface == other
+	}
+	return iface.RawIsdas == other.RawIsdas && iface.IfID == other.IfID
 }
 
 func (iface PathInterface) String() string {
@@ -227,6 +369,10 @@ func (iface PathInterface) String() string {
 
 type ASInfoReq struct {
 	Isdas addr.IAInt
+}
+
+func (r ASInfoReq) String() string {
+	return r.Isdas.String()
 }
 
 type ASInfoReply struct {
@@ -283,6 +429,10 @@ type IFInfoRequest struct {
 	IfIDs []common.IFIDType
 }
 
+func (r IFInfoRequest) String() string {
+	return fmt.Sprintf("%v", r.IfIDs)
+}
+
 type IFInfoReply struct {
 	RawEntries []IFInfoReplyEntry `capnp:"entries"`
 }
@@ -304,34 +454,11 @@ type IFInfoReplyEntry struct {
 }
 
 type ServiceInfoRequest struct {
-	ServiceTypes []ServiceType
+	ServiceTypes []proto.ServiceType
 }
 
-type ServiceType uint16
-
-const (
-	SvcBS ServiceType = iota
-	SvcPS
-	SvcCS
-	SvcBR
-	SvcSB
-)
-
-func (st ServiceType) String() string {
-	switch st {
-	case SvcBS:
-		return "BS"
-	case SvcPS:
-		return "PS"
-	case SvcCS:
-		return "CS"
-	case SvcBR:
-		return "BR"
-	case SvcSB:
-		return "SB"
-	default:
-		return "??"
-	}
+func (r ServiceInfoRequest) String() string {
+	return fmt.Sprintf("%v", r.ServiceTypes)
 }
 
 type ServiceInfoReply struct {
@@ -339,7 +466,7 @@ type ServiceInfoReply struct {
 }
 
 type ServiceInfoReplyEntry struct {
-	ServiceType ServiceType
+	ServiceType proto.ServiceType
 	Ttl         uint32
 	HostInfos   []HostInfo
 }

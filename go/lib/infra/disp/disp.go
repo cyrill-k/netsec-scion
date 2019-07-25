@@ -42,6 +42,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/scionproto/scion/go/lib/common"
@@ -121,7 +122,8 @@ func (d *Dispatcher) Request(ctx context.Context, msg proto.Cerealizable,
 
 	reply, err := d.waitTable.waitForReply(ctx, msg)
 	if err != nil {
-		return nil, common.NewBasicError(infra.StrInternalError, err, "op", "waitTable.WaitForReply")
+		return nil, common.NewBasicError(infra.StrInternalError, err,
+			"op", "waitTable.WaitForReply")
 	}
 	return reply, nil
 }
@@ -160,7 +162,7 @@ func (d *Dispatcher) RecvFrom(ctx context.Context) (proto.Cerealizable, net.Addr
 		return event.msg, event.address, nil
 	case <-ctx.Done():
 		// We timed out, return with failure
-		return nil, nil, infra.NewCtxDoneError()
+		return nil, nil, ctx.Err()
 	case <-d.closedChan:
 		// Some other goroutine closed the dispatcher
 		return nil, nil, common.NewBasicError(infra.StrClosedError, nil)
@@ -170,8 +172,6 @@ func (d *Dispatcher) RecvFrom(ctx context.Context) (proto.Cerealizable, net.Addr
 func (d *Dispatcher) goBackgroundReceiver() {
 	go func() {
 		defer log.LogPanicAndExit()
-		d.log.Info("Started")
-		defer d.log.Info("Stopped")
 		defer close(d.stoppedChan)
 	Loop:
 		for {
@@ -195,10 +195,11 @@ func (d *Dispatcher) recvNext() bool {
 	// Once the transport is closed, RecvFrom returns immediately.
 	b, address, err := d.transport.RecvFrom(context.Background())
 	if err != nil {
-		d.log.Warn("error", "err",
-			common.NewBasicError(infra.StrTransportError, err, "op", "RecvFrom"))
-		if err == io.EOF {
+		if isCleanShutdownError(err) {
 			return true
+		} else {
+			d.log.Warn("error", "err",
+				common.NewBasicError(infra.StrTransportError, err, "op", "RecvFrom"))
 		}
 		return false
 	}
@@ -249,7 +250,7 @@ func (d *Dispatcher) Close(ctx context.Context) error {
 	// Wait for background goroutine to finish
 	select {
 	case <-ctx.Done():
-		return infra.NewCtxDoneError()
+		return ctx.Err()
 	case <-d.stoppedChan:
 		return nil
 	}
@@ -258,4 +259,14 @@ func (d *Dispatcher) Close(ctx context.Context) error {
 type readEventDesc struct {
 	address net.Addr
 	msg     proto.Cerealizable
+}
+
+func isCleanShutdownError(err error) bool {
+	if err == io.EOF {
+		return true
+	}
+	if strings.Contains(err.Error(), "use of closed network connection") {
+		return true
+	}
+	return false
 }

@@ -50,14 +50,16 @@ class CorePathServer(PathServer):
     server.
     """
 
-    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH, prom_export=None):
+    def __init__(self, server_id, conf_dir, spki_cache_dir=GEN_CACHE_PATH,
+                 prom_export=None, sciond_path=None):
         """
         :param str server_id: server identifier.
         :param str conf_dir: configuration directory.
         :param str prom_export: prometheus export address.
+        :param str sciond_path: path to sciond socket.
         """
         super().__init__(server_id, conf_dir, spki_cache_dir=spki_cache_dir,
-                         prom_export=prom_export)
+                         prom_export=prom_export, sciond_path=sciond_path)
         # Sanity check that we should indeed be a core path server.
         assert self.topology.is_core_as, "This shouldn't be a local PS!"
         self._master_id = None  # Address of master core Path Server.
@@ -301,7 +303,8 @@ class CorePathServer(PathServer):
         core_segs = set(self.core_segments(**params))
         if not core_segs and new_request and PATH_FLAG_CACHEONLY not in flags:
             # Segments not found and it is a new request.
-            self.pending_req[(dst_ia, sibra)][str(meta)] = (req, req_id, meta, logger)
+            with self.pen_req_lock:
+                self.pending_req[(dst_ia, sibra)][str(meta)] = (req, req_id, meta, logger)
             # If dst is in remote ISD then a segment may be kept by master.
             if dst_ia[0] != self.addr.isd_as[0]:
                 self._query_master(dst_ia, logger, flags=flags)
@@ -332,7 +335,8 @@ class CorePathServer(PathServer):
                 first_ia=dseg_ia, last_ia=self.addr.isd_as, sibra=sibra)
             if not tmp_core_segs and new_request and PATH_FLAG_CACHEONLY not in flags:
                 # Core segment not found and it is a new request.
-                self.pending_req[(dseg_ia, sibra)][str(meta)] = (seg_req, req_id, meta, logger)
+                with self.pen_req_lock:
+                    self.pending_req[(dseg_ia, sibra)][str(meta)] = (seg_req, req_id, meta, logger)
                 if dst_ia[0] != self.addr.isd_as[0]:
                     # Master may know a segment.
                     self._query_master(dseg_ia, logger, flags=flags)
@@ -348,7 +352,8 @@ class CorePathServer(PathServer):
         This must not be executed for a pending request.
         """
         sibra = PATH_FLAG_SIBRA in flags
-        self.pending_req[(dst_ia, sibra)][str(meta)] = (seg_req, req_id, meta, logger)
+        with self.pen_req_lock:
+            self.pending_req[(dst_ia, sibra)][str(meta)] = (seg_req, req_id, meta, logger)
         if dst_ia[0] == self.addr.isd_as[0]:
             # Master may know down segment as dst is in local ISD.
             self._query_master(dst_ia, logger, flags=flags)

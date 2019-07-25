@@ -4,6 +4,10 @@ CC = clang
 CFLAGS ?= -Wall -Werror -g -fPIC
 LDFLAGS ?= -shared -Wl,-z,defs -lscion -lzlog
 
+ifeq ($(D),1)
+CFLAGS += -gdwarf-2 -O0
+endif
+
 LIB_DIR = ..
 INC = -I$(LIB_DIR)
 
@@ -34,11 +38,13 @@ $(DYNAMIC): $(OBJS)
 install: .installstamp
 
 .installstamp: $(TARGETS)
+	@sudo -p "c/lib/filter:install [sudo] password for %p: " true
 	sudo cp $(TARGETS) $(PREFIX)/lib/
 	sudo ldconfig
 	touch .installstamp
 
 uninstall:
+	@sudo -p "c/lib/filter:uninstall [sudo] password for %p: " true
 	$(foreach var,$(TARGETS),sudo rm -f $(PREFIX)/lib/$(var);)
 	sudo ldconfig
 	rm -f .installstamp

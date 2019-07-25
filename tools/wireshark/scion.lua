@@ -58,6 +58,10 @@ local scmpTypes = {
         [0] = "UNSPECIFIED",
         [1] = "ECHO_REQUEST",
         [2] = "ECHO_REPLY",
+        [3] = "TRACE_ROUTE_REQUEST",
+        [4] = "TRACE_ROUTE_REPLY",
+        [5] = "RECORD_PATH_REQUEST",
+        [6] = "RECORD_PATH_REPLY",
     },
     ["ROUTING"] = {
         [0] = "UNREACH_NET",
@@ -85,11 +89,10 @@ local scmpTypes = {
         [3] = "BAD_IF",
         [4] = "REVOKED_IF",
         [5] = "NON_ROUTING_HOPF",
-        [6] = "DELIVERY_FWD_ONLY",
-        [7] = "DELIVERY_NON_LOCAL",
-        [8] = "BAD_SEGMENT",
-        [9] = "BAD_INFO_FIELD",
-        [10] = "BAD_HOP_FIELD",
+        [6] = "DELIVERY_NON_LOCAL",
+        [7] = "BAD_SEGMENT",
+        [8] = "BAD_INFO_FIELD",
+        [9] = "BAD_HOP_FIELD",
     },
     ["EXT"] = {
         [0] = "TOO_MANY_HOPBYHOP",
@@ -121,9 +124,9 @@ local scion_ch_hopoff = ProtoField.uint8("scion.ch.hop_off", "Hop Field offset",
 local scion_ch_nexthdr = ProtoField.uint8("scion.ch.next_hdr", "Next header", base.DEC, hdrTypes)
 
 local scion_addr_dst_isd = ProtoField.uint16("scion.addr.dst_isd", "Dest ISD", base.DEC)
-local scion_addr_dst_as = ProtoField.uint64("scion.addr.dst_as", "Dest AS", base.DEC)
+local scion_addr_dst_as = ProtoField.string("scion.addr.dst_as", "Dest AS")
 local scion_addr_src_isd = ProtoField.uint16("scion.addr.src_isd", "Src ISD", base.DEC)
-local scion_addr_src_as = ProtoField.uint64("scion.addr.src_as", "Src AS", base.DEC)
+local scion_addr_src_as = ProtoField.string("scion.addr.src_as", "Src AS")
 local scion_addr_dst_ipv4 = ProtoField.ipv4("scion.addr.dst_ipv4", "Dest IPv4")
 local scion_addr_dst_ipv6 = ProtoField.ipv6("scion.addr.dst_ipv6", "Dest IPv6")
 local scion_addr_dst_svc = ProtoField.uint16("scion.addr.dst_svc", "Dest SVC", base.HEX, svcTypes)
@@ -146,10 +149,6 @@ local scion_path_info_isd = ProtoField.uint16("scion.path.info.isd", "ISD", base
 local scion_path_info_hops = ProtoField.uint8("scion.path.info.hops", "Hops", base.DEC)
 
 local scion_path_hop_flags = ProtoField.uint8("scion.path.hop.flags", "Flags", base.HEX)
-local scion_path_hop_flags_recurse = ProtoField.bool("scion.path.hop.flags.recurse",
-    "Recurse", 8, nil, 0x8)
-local scion_path_hop_flags_fwdonly = ProtoField.bool("scion.path.hop.flags.fwdonly",
-    "Forward-Only", 8, nil, 0x4)
 local scion_path_hop_flags_verifyonly = ProtoField.bool("scion.path.hop.flags.verifyonly",
     "Verify-Only", 8, nil, 0x2)
 local scion_path_hop_flags_xover = ProtoField.bool("scion.path.hop.flags.xover",
@@ -240,8 +239,6 @@ scion_proto.fields={
     scion_path_info_isd,
     scion_path_info_hops,
     scion_path_hop_flags,
-    scion_path_hop_flags_recurse,
-    scion_path_hop_flags_fwdonly,
     scion_path_hop_flags_verifyonly,
     scion_path_hop_flags_xover,
     scion_path_hop_exp_raw,
@@ -409,20 +406,32 @@ function parse_cmn_hdr(buffer, tree, meta)
     return ch
 end
 
+function format_as(as)
+    local asDec = as:uint64()
+    if asDec > 1 and asDec <= 0xffffffff then
+        asStr = string.format("%s", asDec)
+    else
+        asStr = string.format("%x:%x:%x", as:bitfield(0, 16), as:bitfield(16, 16), as:bitfield(32, 16))
+    end
+    return asStr
+end
+
 function parse_addr_hdr(buffer, tree, meta)
     local t = tree:add(buffer, string.format("SCION Address header [%dB]", meta.addrTotalLen))
     -- dst ISD-AS
     local dstIaT = t:add(buffer(0, iaLen), string.format("Destination ISD-AS [%dB]", iaLen))
     meta["dstIsd"] = buffer(0, 2):bitfield(0, 16)
     dstIaT:add(scion_addr_dst_isd, buffer(0, 2), meta.dstIsd)
-    meta["dstAs"] = buffer(0, iaLen):bitfield(16, 48)
-    dstIaT:add(scion_addr_dst_as, buffer(1, iaLen-1), meta.dstAs)
+    local dstAs = buffer(2, iaLen - 2)
+    meta["dstAs"] = format_as(dstAs)
+    dstIaT:add(scion_addr_dst_as, dstAs, meta.dstAs)
     -- src ISD-AS
     local srcIaT = t:add(buffer(iaLen, iaLen), string.format("Source ISD-AS [%dB]", iaLen))
     meta["srcIsd"] = buffer(iaLen, 2):bitfield(0, 16)
     srcIaT:add(scion_addr_src_isd, buffer(iaLen, 2), meta.srcIsd)
-    meta["srcAs"] = buffer(iaLen, iaLen):bitfield(16, 48)
-    srcIaT:add(scion_addr_src_as, buffer(iaLen+1, iaLen-1), meta.srcAs)
+    local srcAs = buffer(iaLen + 2, iaLen - 2)
+    meta["srcAs"] = format_as(srcAs)
+    srcIaT:add(scion_addr_src_as, srcAs, meta.srcAs)
     -- dst addr
     local dstBuf = buffer(iaLen * 2, addrLens[meta.dstType])
     local dstProto, dstAddr
@@ -520,14 +529,12 @@ function parse_hop_field(buffer, tree, hopNr, ts)
     local flags = buffer(0, 1)
     local flagsT = t:add(scion_path_hop_flags, flags)
     flagsT:append_text(", " .. hop_flag_desc(flags:uint()))
-    flagsT:add(scion_path_hop_flags_recurse, flags)
-    flagsT:add(scion_path_hop_flags_fwdonly, flags)
     flagsT:add(scion_path_hop_flags_verifyonly, flags)
     flagsT:add(scion_path_hop_flags_xover, flags)
     local rawExpTime = buffer(1, 1):uint()
     local subt = t:add(scion_path_hop_exp_raw, buffer(1, 1), rawExpTime)
-    subt:add(scion_path_hop_exp_rel, buffer(1, 1), NSTime.new(rawExpTime * segExpUnit))
-    subt:add(scion_path_hop_exp_abs, buffer(1, 1), NSTime.new((rawExpTime * segExpUnit) + ts))
+    subt:add(scion_path_hop_exp_rel, buffer(1, 1), NSTime.new((rawExpTime + 1) * segExpUnit))
+    subt:add(scion_path_hop_exp_abs, buffer(1, 1), NSTime.new(((rawExpTime + 1) * segExpUnit) + ts))
     -- XXX(kormat): this assumes the "standard" hop field size and layout, 2x 12bit IFIDs in 3B.
     local igIF = buffer(2, 2):uint64():rshift(4)
     local egIF = buffer(3, 2):uint64():band(0x0FFF)
@@ -545,12 +552,6 @@ function hop_flag_desc(flag)
     end
     if bit.band(flag, 0x2) > 0 then
         table.insert(desc, "VERIFY-ONLY")
-    end
-    if bit.band(flag, 0x4) > 0 then
-        table.insert(desc, "FORWARD-ONLY")
-    end
-    if bit.band(flag, 0x8) > 0 then
-        table.insert(desc, "RECURSE")
     end
     if #desc == 0 then
         return ""

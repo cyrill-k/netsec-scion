@@ -27,8 +27,9 @@ import (
 	"github.com/scionproto/scion/go/lib/addr"
 	"github.com/scionproto/scion/go/lib/as_conf"
 	"github.com/scionproto/scion/go/lib/common"
+	"github.com/scionproto/scion/go/lib/keyconf"
+	"github.com/scionproto/scion/go/lib/scrypto"
 	"github.com/scionproto/scion/go/lib/topology"
-	"github.com/scionproto/scion/go/lib/util"
 )
 
 // Conf is the main config structure.
@@ -42,6 +43,8 @@ type Conf struct {
 	BR *topology.BRInfo
 	// ASConf is the local AS configuration.
 	ASConf *as_conf.ASConf
+	// MasterKeys holds the local AS master keys.
+	MasterKeys keyconf.Master
 	// HFMacPool is the pool of Hop Field MAC generation instances.
 	HFMacPool sync.Pool
 	// Net is the network configuration of this router.
@@ -75,20 +78,24 @@ func Load(id, confDir string) (*Conf, error) {
 		return nil, err
 	}
 	conf.ASConf = as_conf.CurrConf
-
+	// Load master keys
+	conf.MasterKeys, err = keyconf.LoadMaster(filepath.Join(conf.Dir, "keys"))
+	if err != nil {
+		return nil, common.NewBasicError("Unable to load master keys", err)
+	}
 	// Generate keys
 	// This uses 16B keys with 1000 hash iterations, which is the same as the
 	// defaults used by pycrypto.
-	hfGenKey := pbkdf2.Key(conf.ASConf.MasterASKey, []byte("Derive OF Key"), 1000, 16, sha256.New)
+	hfGenKey := pbkdf2.Key(conf.MasterKeys.Key0, []byte("Derive OF Key"), 1000, 16, sha256.New)
 
 	// First check for MAC creation errors.
-	if _, err = util.InitMac(hfGenKey); err != nil {
+	if _, err = scrypto.InitMac(hfGenKey); err != nil {
 		return nil, err
 	}
 	// Create a pool of MAC instances.
 	conf.HFMacPool = sync.Pool{
 		New: func() interface{} {
-			mac, _ := util.InitMac(hfGenKey)
+			mac, _ := scrypto.InitMac(hfGenKey)
 			return mac
 		},
 	}

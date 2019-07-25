@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,10 +33,10 @@ var _ common.Timeout = (*RevTimeError)(nil)
 
 type RevTimeError string
 
-func NewRevTimeError(ts uint64, ttl uint32) RevTimeError {
+func NewRevTimeError(r *RevInfo) RevTimeError {
 	return RevTimeError(fmt.Sprintf(
-		"Revocation is expired, timestamp: %s, TTL %ds.",
-		util.TimeToString(util.USecsToTime(ts)), ttl))
+		"Revocation is expired, timestamp: %s, TTL %s.",
+		util.TimeToString(r.Timestamp()), r.TTL()))
 }
 
 func (ee RevTimeError) Timeout() bool {
@@ -49,13 +50,14 @@ func (ee RevTimeError) Error() string {
 var _ proto.Cerealizable = (*RevInfo)(nil)
 
 type RevInfo struct {
-	IfID     uint64
+	IfID     common.IFIDType
 	RawIsdas addr.IAInt `capnp:"isdas"`
 	// LinkType of revocation
-	LinkType  proto.LinkType
-	Timestamp uint64
-	// TTL validity period of the revocation in seconds
-	TTL uint32 `capnp:"ttl"`
+	LinkType proto.LinkType
+	// RawTimestamp the issuing timestamp in seconds.
+	RawTimestamp uint32 `capnp:"timestamp"`
+	// RawTTL validity period of the revocation in seconds
+	RawTTL uint32 `capnp:"ttl"`
 }
 
 func NewRevInfoFromRaw(b common.RawBytes) (*RevInfo, error) {
@@ -67,19 +69,32 @@ func (r *RevInfo) IA() addr.IA {
 	return r.RawIsdas.IA()
 }
 
+// Timestamp returns the issuing time stamp of the revocation.
+func (r *RevInfo) Timestamp() time.Time {
+	return util.SecsToTime(r.RawTimestamp)
+}
+
+func (r *RevInfo) TTL() time.Duration {
+	return time.Duration(r.RawTTL) * time.Second
+}
+
+func (r *RevInfo) Expiration() time.Time {
+	return r.Timestamp().Add(r.TTL())
+}
+
 func (r *RevInfo) Active() error {
-	if r.TTL < uint32(MinRevTTL.Seconds()) {
+	if r.TTL() < MinRevTTL {
 		return common.NewBasicError("Revocation TTL smaller than MinRevTTL.", nil,
-			"TTL", r.TTL, "MinRevTTL", MinRevTTL.Seconds())
+			"TTL", r.TTL().Seconds(), "MinRevTTL", MinRevTTL.Seconds())
 	}
-	now := uint64(time.Now().Unix())
+	now := time.Now()
 	// Revocation is not valid if timestamp is not within the TTL window
-	if r.Timestamp+uint64(r.TTL) < now {
-		return NewRevTimeError(r.Timestamp, r.TTL)
+	if r.Expiration().Before(now) {
+		return NewRevTimeError(r)
 	}
-	if r.Timestamp > now+1 {
+	if r.Timestamp().After(now.Add(time.Second)) {
 		return common.NewBasicError("Revocation timestamp is in the future.", nil,
-			"timestamp", util.TimeToString(util.USecsToTime(r.Timestamp)))
+			"timestamp", util.TimeToString(r.Timestamp()))
 	}
 	return nil
 }
@@ -88,9 +103,36 @@ func (r *RevInfo) ProtoId() proto.ProtoIdType {
 	return proto.RevInfo_TypeID
 }
 
+func (r *RevInfo) Pack() (common.RawBytes, error) {
+	return proto.PackRoot(r)
+}
+
 func (r *RevInfo) String() string {
-	return fmt.Sprintf("IA: %s IfID: %d Link type: %s Timestamp: %s TTL: %ds", r.IA(), r.IfID,
-		r.LinkType, util.TimeToString(util.USecsToTime(uint64(r.Timestamp))), r.TTL)
+	return fmt.Sprintf("IA: %s IfID: %d Link type: %s Timestamp: %s TTL: %s", r.IA(), r.IfID,
+		r.LinkType, util.TimeToString(r.Timestamp()), r.TTL())
+}
+
+// RelativeTTL returns the duration r is still valid for, relative to
+// reference. If the revocation is already expired, the returned value is 0.
+func (r *RevInfo) RelativeTTL(reference time.Time) time.Duration {
+	expiration := r.Expiration()
+	if expiration.Before(reference) {
+		return 0
+	}
+	return expiration.Sub(reference)
+}
+
+func (r *RevInfo) Eq(other *RevInfo) bool {
+	return r.SameIntf(other) &&
+		r.RawTimestamp == other.RawTimestamp &&
+		r.RawTTL == other.RawTTL
+}
+
+// SameIntf returns true if r and other both apply to the same interface.
+func (r *RevInfo) SameIntf(other *RevInfo) bool {
+	return r.IfID == other.IfID &&
+		r.RawIsdas == other.RawIsdas &&
+		r.LinkType == other.LinkType
 }
 
 var _ proto.Cerealizable = (*SignedRevInfo)(nil)
@@ -106,6 +148,18 @@ func NewSignedRevInfoFromRaw(b common.RawBytes) (*SignedRevInfo, error) {
 	return sr, proto.ParseFromRaw(sr, sr.ProtoId(), b)
 }
 
+func NewSignedRevInfo(r *RevInfo, s *proto.SignS) (*SignedRevInfo, error) {
+	rawR, err := r.Pack()
+	if err != nil {
+		return nil, err
+	}
+	return &SignedRevInfo{
+		Blob:    rawR,
+		Sign:    s,
+		revInfo: r,
+	}, nil
+}
+
 func (sr *SignedRevInfo) ProtoId() proto.ProtoIdType {
 	return proto.SignedBlob_TypeID
 }
@@ -118,6 +172,6 @@ func (sr *SignedRevInfo) RevInfo() (*RevInfo, error) {
 	return sr.revInfo, err
 }
 
-func (sp *SignedRevInfo) String() string {
-	return fmt.Sprintf("SignedRevInfo: %s %s", sp.Blob, sp.Sign)
+func (sr *SignedRevInfo) String() string {
+	return fmt.Sprintf("SignedRevInfo: %s %s", sr.Blob, sr.Sign)
 }

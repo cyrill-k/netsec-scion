@@ -1,17 +1,31 @@
 #!/bin/bash
 
-TOOL=circleci
+. tools/ci/common.sh
 
-if ! type -P "$TOOL" &>/dev/null; then
-    echo "$TOOL tool not found in \$PATH. See https://circleci.com/docs/2.0/local-jobs/ for how to install it."
-    exit 1
-fi
-
-# First, do a config check
-"$TOOL" config validate || exit 1
+./docker.sh build || exit 1
+[ -n "$DOCKER_BE" ] && { make -sC docker/perapp || exit 1; }
 
 tmpdir=$(mktemp -d /tmp/artifacts.XXXXXXX)
+SCION_MOUNT="$tmpdir" ./docker.sh start || exit 1
+
+result=0
+./tools/ci/build
+result=$((result+$?))
+./tools/ci/lint
+result=$((result+$?))
+./tools/ci/test
+result=$((result+$?))
+
+./tools/ci/integration -a $DOCKER_BE
+result=$((result+$?))
 
 echo "Artifacts dir: $tmpdir"
-"$TOOL" build --job local -v "$tmpdir:/tmp/artifacts"
-echo "Artifacts dir: $tmpdir"
+
+[ $result -eq 0 ] && { ./docker.sh exec ./tools/dc zk down; ./docker.sh stop; }
+
+if [ $result -eq 0 ]; then
+    echo "All tests successful"
+else
+    echo "$result tests failed"
+fi
+exit $result

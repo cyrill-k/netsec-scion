@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,7 +49,6 @@ func (r *Router) handlePktError(rp *rpkt.RtrPkt, perr error, desc string) {
 
 // PackeError creates an SCMP error for the given packet and sends it to its source.
 func (r *Router) PacketError() {
-	defer log.LogPanicAndExit()
 	// Run forever.
 	for args := range r.pktErrorQ {
 		r.doPktError(args.rp, args.perr)
@@ -133,12 +133,7 @@ func (r *Router) createSCMPErrorReply(rp *rpkt.RtrPkt, ct scmp.ClassType,
 			sp.HBHExt = append(sp.HBHExt, e)
 		}
 	}
-	// Add SCMP l4 header and payload
-	var l4Type common.L4ProtocolType
-	if sp.L4 != nil {
-		l4Type = sp.L4.L4Type()
-	}
-	sp.Pld = scmp.PldFromQuotes(ct, info, l4Type, rp.GetRaw)
+	sp.Pld = scmp.PldFromQuotes(ct, info, rp.L4Type, rp.GetRaw)
 	sp.L4 = scmp.NewHdr(ct, sp.Pld.Len())
 	return rp.CreateReply(sp)
 }

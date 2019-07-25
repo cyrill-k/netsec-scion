@@ -75,14 +75,14 @@ class ProtoSign(Cerealizable):
             raise ProtoSignError("Unsupported proto signature type (verify): %s" % self.p.type)
 
     def sig_pack(self, incl_sig=True):
-        # FIXME(worxli) #1524
         b = [str(self.p.type).encode("utf-8"), self.p.src]
         if incl_sig:
             b.append(self.p.signature)
+        b.append(self.p.timestamp.to_bytes(4, 'big'))
         return b"".join(b)
 
     def _sig_input(self, msg):
-        return b"".join([self.sig_pack(False), msg])
+        return b"".join([msg, self.sig_pack(incl_sig=False)])
 
     def __str__(self):
         return "%s: type: %s src: %s ts: %s" % (self.NAME, self.p.type,
@@ -140,8 +140,8 @@ class DefaultSignSrc(Serializable):
         except SCIONParseError as e:
             raise SCIONParseError(
                 "Unable to parse IA. Decoded: %s error: %s" % (decoded, e)) from None
-        self.chain_ver = groups[0][1]
-        self.trc_ver = groups[0][2]
+        self.chain_ver = int(groups[0][1])
+        self.trc_ver = int(groups[0][2])
 
     @classmethod
     def from_values(cls, ia: ISD_AS, chain_ver: int, trc_ver: int) -> 'DefaultSignSrc':

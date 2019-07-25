@@ -9,8 +9,6 @@
 
 #define HOF_FLAG_XOVER        0x01
 #define HOF_FLAG_VERIFY_ONLY  0x02
-#define HOF_FLAG_FORWARD_ONLY 0x04
-#define HOF_FLAG_RECURSE      0x08
 
 #define PATH_TYPE_TDC 0
 #define PATH_TYPE_XOVR 1
@@ -71,8 +69,6 @@ typedef struct {
 
 #define HOF_XOVER(x) ((*x) & HOF_FLAG_XOVER)
 #define HOF_VERIFY(x) ((*x) & HOF_FLAG_VERIFY_ONLY)
-#define HOF_FORWARD(x) ((*x) & HOF_FLAG_FORWARD_ONLY)
-#define HOF_RECURSE(x) ((*x) & HOF_FLAG_RECURSE)
 #define HOF_EXP_TIME(x) (*((uint8_t *)(x) + 1))
 
 uint8_t * get_current_iof(uint8_t *buf);

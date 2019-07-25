@@ -15,6 +15,7 @@
 package sciond
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -22,7 +23,9 @@ import (
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/ctrl/path_mgmt"
 	"github.com/scionproto/scion/go/lib/spath"
+	"github.com/scionproto/scion/go/lib/util"
 	"github.com/scionproto/scion/go/lib/xtest/graph"
+	"github.com/scionproto/scion/go/proto"
 )
 
 var _ Service = (*MockService)(nil)
@@ -58,7 +61,7 @@ func (m *MockService) Connect() (Connector, error) {
 }
 
 func (m *MockService) ConnectTimeout(timeout time.Duration) (Connector, error) {
-	panic("not implemented")
+	return &MockConn{g: m.g}, nil
 }
 
 var _ Connector = (*MockConn)(nil)
@@ -77,7 +80,9 @@ type MockConn struct {
 //
 // Paths does not guarantee to represent a consistent snapshot of the SCION
 // network if the backing multigraph is modified while Paths is running.
-func (m *MockConn) Paths(dst, src addr.IA, max uint16, f PathReqFlags) (*PathReply, error) {
+func (m *MockConn) Paths(ctx context.Context, dst, src addr.IA, max uint16,
+	f PathReqFlags) (*PathReply, error) {
+
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -97,7 +102,7 @@ func (m *MockConn) Paths(dst, src addr.IA, max uint16, f PathReqFlags) (*PathRep
 			PathReplyEntry{
 				Path: &FwdPathMeta{
 					Interfaces: pathInterfaces,
-					ExpTime:    uint32(time.Now().Add(spath.MaxTTL * time.Second).Unix()),
+					ExpTime:    util.TimeToSecs(time.Now().Add(spath.MaxTTL * time.Second)),
 				},
 				HostInfo: HostInfo{
 				// TODO(scrye): leave nil for now since no tests use this
@@ -118,28 +123,32 @@ func (m *MockConn) Paths(dst, src addr.IA, max uint16, f PathReqFlags) (*PathRep
 }
 
 // ASInfo is not implemented.
-func (m *MockConn) ASInfo(ia addr.IA) (*ASInfoReply, error) {
+func (m *MockConn) ASInfo(ctx context.Context, ia addr.IA) (*ASInfoReply, error) {
 	panic("not implemented")
 }
 
 // IFInfo is not implemented.
-func (m *MockConn) IFInfo(ifs []common.IFIDType) (*IFInfoReply, error) {
+func (m *MockConn) IFInfo(ctx context.Context, ifs []common.IFIDType) (*IFInfoReply, error) {
 	panic("not implemented")
 }
 
 // SVCInfo is not implemented.
-func (m *MockConn) SVCInfo(svcTypes []ServiceType) (*ServiceInfoReply, error) {
+func (m *MockConn) SVCInfo(ctx context.Context,
+	svcTypes []proto.ServiceType) (*ServiceInfoReply, error) {
+
 	panic("not implemented")
 }
 
 // RevNotificationFromRaw is not implemented.
-func (m *MockConn) RevNotificationFromRaw(b []byte) (*RevReply, error) {
+func (m *MockConn) RevNotificationFromRaw(ctx context.Context, b []byte) (*RevReply, error) {
 	panic("not implemented")
 }
 
 // RevNotification deletes the edge containing revInfo.IfID from the
 // multigraph. RevNotification does not perform any validation of revInfo.
-func (m *MockConn) RevNotification(sRevInfo *path_mgmt.SignedRevInfo) (*RevReply, error) {
+func (m *MockConn) RevNotification(ctx context.Context,
+	sRevInfo *path_mgmt.SignedRevInfo) (*RevReply, error) {
+
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
@@ -151,7 +160,7 @@ func (m *MockConn) RevNotification(sRevInfo *path_mgmt.SignedRevInfo) (*RevReply
 }
 
 // Close is a no-op.
-func (m *MockConn) Close() error {
+func (m *MockConn) Close(ctx context.Context) error {
 	return nil
 }
 

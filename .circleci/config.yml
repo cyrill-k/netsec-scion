@@ -5,59 +5,102 @@ workflows:
     scion_build_test:
         jobs:
             - build
+    scion_publish:
+        jobs:
+            - publish:
+                filters:
+                    tags:
+                        only: /^v.*/
+                    branches:
+                        ignore: /.*/
 
 jobs:
     build:
-        docker:
-            - image: scionproto/scion_base@sha256:975646f75df9db5a0dd882a4bc6bac36dd63201e0aff920f7ee711053b1ca48e
-        working_directory: /home/scion/go/src/github.com/scionproto/scion
-        environment:
-            - BASH_ENV: /home/scion/.profile
+        machine: true
         steps:
+            # Setup
             - checkout
             - run:
-                name: Environment setup
-                command: ./tools/ci/env_setup |& tee logs/env_setup.run
+                name: Update docker
+                command: sudo apt-get update && sudo ./tools/install_docker
+            - run:
+                name: Pull and tag scion_base image
+                command: ./tools/ci/prepare_image 6ce65fe3ba45c275cc81215c8bbf6e6ccf2a00779da8a54b440e0cf514bca6e6
                 when: always
             - run:
-                name: Build prep
-                command: ./tools/ci/build_prep |& tee logs/build_prep.run
+                name: Build scion:latest image
+                command: ./docker.sh build
                 when: always
+            # - run:
+            #     name: Build app images
+            #     command: make -C docker/perapp
 
-            # Common:
+            # Build and run tests:
+            - run:
+                name: Create and start container
+                command: |
+                    set +e -x
+                    mkdir -p /tmp/artifacts/mount
+                    SCION_MOUNT=/tmp/artifacts/mount ./docker.sh start
+                when: always
             - run:
                 name: Build
-                command: make -s |& tee logs/make.run
+                command: ./tools/ci/build
                 when: always
             - run:
                 name: Lint
-                command: ./scion.sh lint |& tee logs/lint.run
+                command: ./tools/ci/lint
                 when: always
             - run:
-                name: Unit tests & Coverage
-                command: '{ ./scion.sh coverage py; make -sC go test; } |& tee logs/coverage.run'
-                when: always
-            - run:
-                name: Python documentation (sphinx)
-                command: make -f sphinx-doc/Makefile clean html |& tee logs/sphinx.run
+                name: Unit tests and Python documentation (sphinx)
+                command: ./tools/ci/test
                 when: always
             - run:
                 name: Integration tests
-                command: ./integration/integration_test.sh |& tee logs/integration.run
-                when: always
-            - run:
-                name: Gather test artifacts
                 command: |
-                    set +e -x
-                    mv -n python/htmlcov logs gen sphinx-doc/_build/html/ "/tmp/artifacts/$ARTIFACTS"
-                    cp -a /tmp/test_flags "/tmp/artifacts/$ARTIFACTS"
-                    tar caf "/tmp/artifacts.out/$ARTIFACTS.tar.gz" -C /tmp/artifacts "$ARTIFACTS" || exit 1
+                    ./tools/ci/integration
                 when: always
 
+            # Clean up
+            - run:
+                name: Gather logs and stop container
+                command: |
+                    set +e -x
+                    TARGET="${CIRCLE_PR_NUMBER:-$CIRCLE_BRANCH}"
+                    TARGET="${TARGET//\//_}"
+                    BUILD=$(date +%s)
+                    [ -n "$CIRCLE_BUILD_NUM" ] && BUILD="build${CIRCLE_BUILD_NUM}"
+                    ARTIFACTS="circleci.${CIRCLE_PROJECT_USERNAME}.${CIRCLE_PROJECT_REPONAME}.${TARGET}.${BUILD}"
+                    mkdir -p "/tmp/artifacts.out"
+                    mv /tmp/artifacts/{mount,"$ARTIFACTS"}
+                    tar caf "/tmp/artifacts.out/$ARTIFACTS.tar.gz" -C /tmp/artifacts "$ARTIFACTS"
+                    ./docker.sh stop
+                when: always
             - store_artifacts:
                 path: /tmp/artifacts.out
                 destination: /
-            - store_test_results:
-                path: logs/nosetests.xml
+
+    publish:
+        machine: true
+        steps:
+            - checkout
+            - run:
+                name: Update docker
+                command: sudo apt-get update && sudo ./tools/install_docker
+            - run:
+                name: Build base
+                command: ./docker.sh base
+            - run:
+                name: Build image
+                command: ./docker.sh build
+            - run:
+                name: Build app images
+                command: make -C docker/perapp
+            - run:
+                name: Docker login
+                command: docker login -u $DOCKERHUB_USER -p $DOCKERHUB_PASSWORD
+            - run:
+                name: Push images
+                command: ./docker/perapp/publish "$CIRCLE_TAG"
 
 # vim: expandtab:sw=4:sts=4

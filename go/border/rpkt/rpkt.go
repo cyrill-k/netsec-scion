@@ -31,32 +31,30 @@ import (
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/l4"
 	"github.com/scionproto/scion/go/lib/log"
+	"github.com/scionproto/scion/go/lib/overlay"
 	"github.com/scionproto/scion/go/lib/scmp"
 	"github.com/scionproto/scion/go/lib/spath"
 	"github.com/scionproto/scion/go/lib/spkt"
-	"github.com/scionproto/scion/go/lib/topology"
 )
 
 // pktBufSize is the maxiumum size of a packet buffer.
 // FIXME(kormat): this should be reduced as soon as we respect the actual link MTU.
-const pktBufSize = 9 * 1024
+const pktBufSize = 1 << 16
 
 // callbacks is an anonymous struct used for functions supplied by the router
 // for various processing tasks.
 var callbacks struct {
 	rawSRevF func(RawSRevCallbackArgs)
-	ifIDF    func(IFIDCallbackArgs)
 }
 
 // Init takes callback functions provided by the router and stores them for use
 // by the rpkt package.
-func Init(rawSRevF func(RawSRevCallbackArgs), ifIDF func(IFIDCallbackArgs)) {
+func Init(rawSRevF func(RawSRevCallbackArgs)) {
 	callbacks.rawSRevF = rawSRevF
-	callbacks.ifIDF = ifIDF
 }
 
 // Router representation of SCION packet, including metadata.  The comments for the members have
-// tags to specifiy if the member is set during receiving (RECV), parsing (PARSE), processing
+// tags to specify if the member is set during receiving (RECV), parsing (PARSE), processing
 // (PROCESS) or routing (ROUTE). A number of the non-exported fields are pointers, as they are
 // either optional or computed only on demand.
 type RtrPkt struct {
@@ -70,8 +68,6 @@ type RtrPkt struct {
 	TimeIn time.Time
 	// DirFrom is the direction from which the packet was received. (RECV)
 	DirFrom rcmn.Dir
-	// DirTo is the direction to which the packet is travelling. (PARSE)
-	DirTo rcmn.Dir
 	// Ingress contains the incoming overlay metadata the packet arrived with, and the (list of)
 	// interface(s) it arrived on. (RECV)
 	Ingress addrIFPair
@@ -159,23 +155,22 @@ func (rp *RtrPkt) Release() {
 // addrIFPair contains the overlay destination/source addresses, as well as the
 // list of associated interface IDs.
 type addrIFPair struct {
-	Dst    *topology.AddrInfo
-	Src    *topology.AddrInfo
-	IfIDs  []common.IFIDType
-	LocIdx int // only set for packets from the local AS.
-	Sock   string
+	Dst  *overlay.OverlayAddr
+	Src  *overlay.OverlayAddr
+	IfID common.IFIDType
+	Sock string
 }
 
 // EgressPair contains the output function to send a packet with, along with an
 // overlay destination address.
 type EgressPair struct {
 	S   *rctx.Sock
-	Dst *topology.AddrInfo
+	Dst *overlay.OverlayAddr
 }
 
 type EgressRtrPkt struct {
 	Rp  *RtrPkt
-	Dst *topology.AddrInfo
+	Dst *overlay.OverlayAddr
 }
 
 // packetIdxs provides offsets into a packet buffer to the start of various
@@ -218,11 +213,9 @@ func (rp *RtrPkt) Reset() {
 	// Reset the length of the buffer to the max size.
 	rp.Raw = rp.Raw[:cap(rp.Raw)]
 	rp.DirFrom = rcmn.DirUnset
-	rp.DirTo = rcmn.DirUnset
 	rp.Ingress.Dst = nil
 	rp.Ingress.Src = nil
-	rp.Ingress.IfIDs = nil
-	rp.Ingress.LocIdx = -1
+	rp.Ingress.IfID = 0
 	rp.Egress = rp.Egress[:0]
 	// CmnHdr doesn't contain any references.
 	rp.IncrementedPath = false
@@ -294,11 +287,19 @@ func (rp *RtrPkt) ToScnPkt(verify bool) (*spkt.ScnPkt, error) {
 		}
 		sp.E2EExt = append(sp.E2EExt, se)
 	}
+	// Try to parse L4 and Payload, but we might fail to do so, ie. unsupported L4 protocol
 	if sp.L4, err = rp.L4Hdr(verify); err != nil {
-		return nil, err
+		if common.GetErrorMsg(err) != UnsupportedL4 {
+			return nil, err
+		}
 	}
-	if sp.Pld, err = rp.Payload(verify); err != nil {
-		return nil, err
+	if err == nil {
+		// L4 header was parsed without error, then parse payload
+		if sp.Pld, err = rp.Payload(verify); err != nil {
+			if common.GetErrorMsg(err) != UnsupportedL4 {
+				return nil, err
+			}
+		}
 	}
 	return sp, nil
 }
@@ -307,6 +308,17 @@ func (rp *RtrPkt) ToScnPkt(verify bool) (*spkt.ScnPkt, error) {
 // packet identified by the blk argument. This is used, for example, by SCMP to
 // quote parts of the packet in an error response.
 func (rp *RtrPkt) GetRaw(blk scmp.RawBlock) common.RawBytes {
+	pldOff := rp.idxs.pld
+	if pldOff == 0 {
+		// Either we failed to find the L4 header or the L4 header is an unknown protocol.
+		pldOff = len(rp.Raw)
+	}
+	l4Off := rp.idxs.l4
+	if l4Off == 0 {
+		// L4 header not found, likely failed to parse extensions.
+		// Use the last parsed header as L4 offset
+		l4Off = rp.idxs.nextHdrIdx.Index
+	}
 	switch blk {
 	case scmp.RawCmnHdr:
 		return rp.Raw[:spkt.CmnHdrLen]
@@ -315,9 +327,16 @@ func (rp *RtrPkt) GetRaw(blk scmp.RawBlock) common.RawBytes {
 	case scmp.RawPathHdr:
 		return rp.Raw[rp.idxs.path:rp.CmnHdr.HdrLenBytes()]
 	case scmp.RawExtHdrs:
-		return rp.Raw[rp.CmnHdr.HdrLenBytes():rp.idxs.l4]
+		return rp.Raw[rp.CmnHdr.HdrLenBytes():l4Off]
 	case scmp.RawL4Hdr:
-		return rp.Raw[rp.idxs.l4:rp.idxs.pld]
+		end := pldOff
+		if _, ok := rp.l4.(*scmp.Hdr); ok {
+			// XXX Special case, add SCMP info as part of the L4
+			if meta, err := scmp.MetaFromRaw(rp.Raw[rp.idxs.pld:]); err == nil {
+				end += int(scmp.MetaLen + (meta.InfoLen * common.LineLen))
+			}
+		}
+		return rp.Raw[rp.idxs.l4:end]
 	}
 	rp.Crit("Invalid raw block requested", "blk", blk)
 	return nil
@@ -338,8 +357,8 @@ func (rp *RtrPkt) String() string {
 	rp.SrcHost()
 	rp.InfoF()
 	rp.HopF()
-	return fmt.Sprintf("Id: %v Dir from/to: %v/%v Dst: %v %v Src: %v %v\n  InfoF: %v\n  HopF: %v",
-		rp.Id, rp.DirFrom, rp.DirTo, rp.dstIA, rp.dstHost, rp.srcIA, rp.srcHost, rp.infoF, rp.hopF)
+	return fmt.Sprintf("Id: %v Dir from: %v Dst: %v %v Src: %v %v\n  InfoF: %v\n  HopF: %v",
+		rp.Id, rp.DirFrom, rp.dstIA, rp.dstHost, rp.srcIA, rp.srcHost, rp.infoF, rp.hopF)
 }
 
 // ErrStr is a small utility method to combine an error message with a string

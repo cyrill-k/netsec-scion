@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +16,20 @@
 package spath
 
 import (
+	"math"
+	"time"
+
 	"github.com/scionproto/scion/go/lib/common"
 )
 
 const (
-	MaxTTL       = 24 * 60 * 60 // One day in seconds
-	ExpTimeUnit  = MaxTTL / (1 << 8)
-	macInputLen  = 16
-	MaxTimestamp = ^uint32(0)
+	MaxTimestamp = math.MaxUint32
+)
+
+var (
+	// MaxExpirationTime is the maximum absolute expiration time of SCION hop
+	// fields.
+	MaxExpirationTime = time.Unix(MaxTimestamp, 0).Add(MaxTTLField.ToDuration())
 )
 
 type Path struct {
@@ -110,7 +117,7 @@ func (path *Path) InitOffsets() error {
 	path.InfOff = 0
 	path.HopOff = common.LineLen
 	// Cannot initialize an empty path
-	if path == nil || len(path.Raw) == 0 {
+	if path.IsEmpty() {
 		return common.NewBasicError("Unable to initialize empty path", nil)
 	}
 	// Skip Peer with Xover HF
@@ -122,7 +129,7 @@ func (path *Path) InitOffsets() error {
 			return err
 		}
 		if hopF.Xover {
-			path.HopOff += hopF.Len()
+			path.HopOff += HopFieldLength
 		}
 	}
 	err = path.incOffsets(0)
@@ -138,21 +145,25 @@ func (path *Path) InitOffsets() error {
 // IncOffsets updates the info and hop indices to the next routing field, while skipping
 // verify only fields.
 func (path *Path) IncOffsets() error {
-	var hopF *HopField
 	var err error
 	if path.HopOff == 0 {
 		// Path not initialized yet
 		return path.InitOffsets()
 	}
-	if hopF, err = path.GetHopField(path.HopOff); err != nil {
+	if _, err = path.GetHopField(path.HopOff); err != nil {
 		return common.NewBasicError("Hop Field parse error", err, "offset", path.HopOff)
 	}
-	return path.incOffsets(hopF.Len())
+	return path.incOffsets(HopFieldLength)
 }
 
-// incOffsets jumps ahead skip bytes, and searches for the first routing Hop
-// Field starting at that location
-func (path *Path) incOffsets(skip int) error {
+// IsEmpty returns true if the path is nil or empty (no raw data).
+func (path *Path) IsEmpty() bool {
+	return path == nil || len(path.Raw) == 0
+}
+
+// IncOffsetsRaw jumps ahead skip bytes, but DOES NOT by default skip VerifyOnly HF,
+// and searches for the first Hop Field starting at that location
+func (path *Path) IncOffsetsRaw(skip int, skipVerify bool) error {
 	var hopF *HopField
 	infoF, err := path.GetInfoField(path.InfOff)
 	if err != nil {
@@ -172,17 +183,32 @@ func (path *Path) incOffsets(skip int) error {
 		if hopF, err = path.GetHopField(path.HopOff); err != nil {
 			return common.NewBasicError("Hop Field parse error", err, "offset", path.HopOff)
 		}
-		if !hopF.VerifyOnly {
+		if !skipVerify || !hopF.VerifyOnly {
 			break
 		}
-		path.HopOff += hopF.Len()
+		path.HopOff += HopFieldLength
 	}
 	return nil
+}
+
+// incOffsets jumps ahead skip bytes, and searches for the first routing Hop
+// Field starting at that location
+func (path *Path) incOffsets(skip int) error {
+	return path.IncOffsetsRaw(skip, true)
+}
+
+// incOffsetsAny jumps ahead skip bytes, and searches for the first Verify/Routing/any Hop
+// Field starting at that location
+func (path *Path) incOffsetsAny(skip int) error {
+	return path.IncOffsetsRaw(skip, false)
 }
 
 func (path *Path) GetInfoField(offset int) (*InfoField, error) {
 	if offset < 0 {
 		return nil, common.NewBasicError("Negative InfoF offset", nil, "offset", offset)
+	}
+	if path.IsEmpty() {
+		return nil, common.NewBasicError("Unable to get infoField from empty path", nil)
 	}
 	infoF, err := InfoFFromRaw(path.Raw[offset:])
 	if err != nil {
@@ -194,6 +220,9 @@ func (path *Path) GetInfoField(offset int) (*InfoField, error) {
 func (path *Path) GetHopField(offset int) (*HopField, error) {
 	if offset < 0 {
 		return nil, common.NewBasicError("Negative HopF offset", nil, "offset", offset)
+	}
+	if path.IsEmpty() {
+		return nil, common.NewBasicError("Unable to get hopField from empty path", nil)
 	}
 	hopF, err := HopFFromRaw(path.Raw[offset:])
 	if err != nil {

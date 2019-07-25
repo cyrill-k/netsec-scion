@@ -1,4 +1,5 @@
 # Copyright 2015 ETH Zurich
+# Copyright 2018 ETH Zurich, Anapaya Systems
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,22 +40,25 @@ class TestElementInit(object):
     """
     def test_basic(self):
         inst = Element()
-        ntools.assert_equal(inst.public, [])
+        ntools.assert_equal(inst.public, None)
         ntools.assert_is_none(inst.name)
 
     @patch("lib.topology.haddr_parse_interface", autospec=True)
     def test_public(self, parse):
-        public = {'Addr': 'addr', 'L4Port': 'port'}
+        public = {'IPv4': {'Public': {'Addr': 'addr', 'L4Port': 'port'}}}
         inst = Element(public)
         parse.assert_called_with("addr")
-        ntools.eq_(inst.public[0][0], parse.return_value)
+        ntools.eq_(inst.public[0], parse.return_value)
+        ntools.eq_(inst.public[1], 'port')
 
     @patch("lib.topology.haddr_parse_interface", autospec=True)
     def test_bind(self, parse):
-        bind = {'Addr': 'addr', 'L4Port': 'port'}
-        inst = Element(bind=bind)
-        parse.assert_called_with("addr")
-        ntools.eq_(inst.bind[0][0], parse.return_value)
+        bind = {'IPv4': {'Bind': {'Addr': 'pub_addr', 'L4Port': 'port'},
+                         'Public': {'Addr': 'bind_addr', 'L4Port': 'port'}}}
+        inst = Element(bind)
+        parse.assert_has_calls([call('bind_addr'), call('pub_addr')])
+        ntools.eq_(inst.bind[0], parse.return_value)
+        ntools.eq_(inst.public[1], 'port')
 
     def test_name(self):
         name = create_mock(["__str__"])
@@ -72,18 +76,17 @@ class TestInterfaceElementInit(object):
 
     @patch("lib.topology.haddr_parse_interface", autospec=True)
     @patch("lib.topology.ISD_AS", autospec=True)
-    @patch("lib.topology.Element.__init__", autospec=True)
+    @patch("lib.topology.RouterAddrElement.__init__", autospec=True)
     def test_full(self, super_init, isd_as, parse):
         intf_dict = {
-            'InternalAddrIdx': 0,
             'Overlay': 'UDP/IPv4',
-            'Public': {
+            'PublicOverlay': {
                 'Addr': 'addr',
-                'L4Port': 6
+                'OverlayPort': 6
             },
-            'Remote': {
+            'RemoteOverlay': {
                 'Addr': 'toaddr',
-                'L4Port': 5
+                'OverlayPort': 5
             },
             'Bandwidth': 1001,
             'ISD_AS': '3-ff00:0:301',
@@ -91,11 +94,11 @@ class TestInterfaceElementInit(object):
             'MTU': 4242
         }
         if_id = 1
-        public = {'Addr': 'addr', 'L4Port': 6}
+        addrs = {'IPv4': {'PublicOverlay': {'Addr': 'addr', 'OverlayPort': 6}}}
         # Call
         inst = InterfaceElement(if_id, intf_dict, 'name')
         # Tests
-        super_init.assert_called_once_with(inst, public, None, 'name')
+        super_init.assert_called_once_with(inst, addrs, 'name')
         ntools.eq_(inst.if_id, 1)
         ntools.eq_(inst.isd_as, isd_as.return_value)
         ntools.eq_(inst.link_type, "parent")
@@ -103,7 +106,31 @@ class TestInterfaceElementInit(object):
         ntools.eq_(inst.mtu, 4242)
         ntools.eq_(inst.overlay, "UDP/IPv4")
         parse.assert_called_once_with("toaddr")
-        ntools.eq_(inst.remote[0], (parse.return_value, 5))
+        ntools.eq_(inst.remote, (parse.return_value, 5))
+
+    @patch("lib.topology.haddr_parse_interface", autospec=True)
+    @patch("lib.topology.ISD_AS", autospec=True)
+    @patch("lib.topology.RouterAddrElement.__init__", autospec=True)
+    def test_stripped(self, super_init, isd_as, parse):
+        intf_dict = {
+            'Bandwidth': 1001,
+            'ISD_AS': '3-ff00:0:301',
+            'LinkTo': 'PARENT',
+            'MTU': 4242
+        }
+        if_id = 1
+        # Call
+        inst = InterfaceElement(if_id, intf_dict, 'name')
+        # Tests
+        super_init.assert_called_once_with(inst, None, 'name')
+        ntools.eq_(inst.if_id, 1)
+        ntools.eq_(inst.isd_as, isd_as.return_value)
+        ntools.eq_(inst.link_type, "parent")
+        ntools.eq_(inst.bandwidth, 1001)
+        ntools.eq_(inst.mtu, 4242)
+        ntools.eq_(inst.overlay, None)
+        assert parse.call_count == 0
+        ntools.eq_(inst.remote, None)
 
 
 class TestTopologyParseDict(object):
@@ -139,6 +166,8 @@ class TestTopologyParseSrvDicts(object):
             'CertificateService': {"cs1": "cs1 val"},
             'PathService': {"ps1": "ps1 val", "ps2": "ps2 val"},
             'SibraService': {"sb1": "sb1 val"},
+            'SIG': {"sig1": "sig1 val"},
+            'DiscoveryService': {"ds1": "ds1 val"},
         }
         inst = Topology()
         server.side_effect = lambda v, k: "%s-%s" % (k, v)
@@ -146,14 +175,19 @@ class TestTopologyParseSrvDicts(object):
         inst._parse_srv_dicts(topo_dict)
         # Tests
         assert_these_calls(server, [
-            call("bs1 val", "bs1"), call("cs1 val", "cs1"),
-            call("ps1 val", "ps1"), call("ps2 val", "ps2"),
+            call("bs1 val", "bs1"),
+            call("cs1 val", "cs1"),
+            call("ps1 val", "ps1"),
+            call("ps2 val", "ps2"),
             call("sb1 val", "sb1"),
+            call("sig1 val", "sig1"),
+            call("ds1 val", "ds1"),
         ], any_order=True)
         ntools.eq_(inst.beacon_servers, ["bs1-bs1 val"])
         ntools.eq_(inst.certificate_servers, ["cs1-cs1 val"])
         ntools.eq_(sorted(inst.path_servers),
                    sorted(["ps1-ps1 val", "ps2-ps2 val"]))
+        ntools.eq_(inst.discovery_servers, ["ds1-ds1 val"])
 
 
 class TestTopologyParseRouterDicts(object):

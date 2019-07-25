@@ -19,14 +19,14 @@ import (
 	"time"
 
 	"github.com/scionproto/scion/go/lib/common"
-	"github.com/scionproto/scion/go/lib/crypto"
+	"github.com/scionproto/scion/go/lib/scrypto"
 	"github.com/scionproto/scion/go/lib/util"
 )
 
 var _ Cerealizable = (*SignS)(nil)
 
 type SignS struct {
-	Timestamp uint64
+	Timestamp uint32
 	Type      SignType
 	// Src holds the required metadata to verify the signature. The format is "STRING: METADATA".
 	// The prefix consists of "STRING: " and is required to match the regex "^\w+\: ".
@@ -56,14 +56,14 @@ func (s *SignS) Sign(key, message common.RawBytes) (common.RawBytes, error) {
 	case SignType_none:
 		return nil, nil
 	case SignType_ed25519:
-		return crypto.Sign(message, key, crypto.Ed25519)
+		return scrypto.Sign(s.sigPack(message, false), key, scrypto.Ed25519)
 	}
 	return nil, common.NewBasicError("SignS.Sign: Unsupported SignType", nil, "type", s.Type)
 }
 
 func (s *SignS) SignAndSet(key, message common.RawBytes) error {
 	var err error
-	s.Timestamp = uint64(time.Now().Unix())
+	s.Timestamp = util.TimeToSecs(time.Now())
 	s.Signature, err = s.Sign(key, message)
 	return err
 }
@@ -71,7 +71,7 @@ func (s *SignS) SignAndSet(key, message common.RawBytes) error {
 // Time returns the timestamp. If the receiver is nil, the zero value is returned.
 func (s *SignS) Time() time.Time {
 	if s != nil {
-		return util.USecsToTime(s.Timestamp)
+		return util.SecsToTime(s.Timestamp)
 	}
 	return time.Time{}
 }
@@ -81,18 +81,26 @@ func (s *SignS) Verify(key, message common.RawBytes) error {
 	case SignType_none:
 		return nil
 	case SignType_ed25519:
-		return crypto.Verify(message, s.Signature, key, crypto.Ed25519)
+		return scrypto.Verify(s.sigPack(message, false), s.Signature, key, scrypto.Ed25519)
 	}
 	return common.NewBasicError("SignS.Verify: Unsupported SignType", nil, "type", s.Type)
 }
 
 func (s *SignS) Pack() common.RawBytes {
-	raw := make(common.RawBytes, 8)
-	common.Order.PutUint64(raw, s.Timestamp)
-	raw = append(raw, common.RawBytes(s.Type.String())...)
-	raw = append(raw, s.Src...)
-	raw = append(raw, s.Signature...)
-	return raw
+	return s.sigPack(nil, true)
+}
+
+// sigPack appends the type, src, signature (if needed) and timestamp fields to msg
+func (s *SignS) sigPack(msg common.RawBytes, inclSig bool) common.RawBytes {
+	msg = append(common.RawBytes(nil), msg...)
+	msg = append(msg, common.RawBytes(s.Type.String())...)
+	msg = append(msg, s.Src...)
+	if inclSig {
+		msg = append(msg, s.Signature...)
+	}
+	t := make(common.RawBytes, 4)
+	common.Order.PutUint32(t, s.Timestamp)
+	return append(msg, t...)
 }
 
 func (s *SignS) ProtoId() ProtoIdType {

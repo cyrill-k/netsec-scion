@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
-
 	"testing"
 
 	. "github.com/smartystreets/goconvey/convey"
@@ -51,11 +50,11 @@ func prepareRtrPacketSample() *RtrPkt {
 	var config = &conf.Conf{
 		IA: addr.IA{I: 1, A: 2},
 		Net: &netconf.NetConf{
-			IFs: map[common.IFIDType]*netconf.Interface{777: nil},
+			IFs: map[common.IFIDType]*netconf.Interface{5: nil},
 		},
 	}
-	r.Ctx = rctx.New(config, 777)
-	r.Ingress = addrIFPair{IfIDs: []common.IFIDType{1, 2}}
+	r.Ctx = rctx.New(config)
+	r.Ingress = addrIFPair{IfID: 5}
 	return r
 }
 

@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -101,7 +101,7 @@ func (i *Isd) Write(path string, force bool) error {
 // Trc holds the parameters that are used to generate a Trc.
 type Trc struct {
 	Version        uint64        `comment:"The version of the TRC. Must not be 0."`
-	IssuingTime    uint64        `comment:"Time of issuance as UNIX epoch. If 0 will be set to now."`
+	IssuingTime    uint32        `comment:"Time of issuance as UNIX epoch. If 0 will be set to now."`
 	Validity       time.Duration `ini:"-"`
 	RawValidity    string        `ini:"Validity" comment:"The validity of the certificate as duration string, e.g., 180d or 36h"`
 	CoreIAs        []addr.IA     `ini:"-"`
@@ -113,7 +113,7 @@ type Trc struct {
 
 func (t *Trc) validate() error {
 	if t.IssuingTime == 0 {
-		t.IssuingTime = uint64(time.Now().Unix())
+		t.IssuingTime = util.TimeToSecs(time.Now())
 	}
 	if t.Version == 0 {
 		return common.NewBasicError(ErrTrcVersionNotSet, nil)
@@ -133,7 +133,7 @@ func (t *Trc) validate() error {
 		return common.NewBasicError(ErrCoreIANotSet, nil)
 	} else {
 		for _, ia := range t.CoreIAs {
-			if ia.I == 0 || ia.A == 0 {
+			if ia.IsWildcard() {
 				return common.NewBasicError(ErrInvalidCoreIA, nil, "ia", ia)
 			}
 		}

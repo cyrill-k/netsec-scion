@@ -16,14 +16,18 @@ package xtest
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
+	"time"
 
 	"github.com/scionproto/scion/go/lib/addr"
+	"github.com/scionproto/scion/go/lib/common"
 )
 
 // TempFileName creates a temporary file in dir with the specified prefix, and
@@ -140,11 +144,57 @@ func MustParseIA(s string) addr.IA {
 }
 
 // MustParseAS parses s and returns the corresponding addr.AS object. It panics
-// if s is not valid AS representation
+// if s is not valid AS representation.
 func MustParseAS(s string) addr.AS {
 	ia, err := addr.ASFromString(s)
 	if err != nil {
 		panic(err)
 	}
 	return ia
+}
+
+// MustParseHexString parses s and returns the corresponding byte slice.
+// It panics if the decoding fails.
+func MustParseHexString(s string) common.RawBytes {
+	// remove whitespace
+	reg, err := regexp.Compile(`\s+`)
+	if err != nil {
+		panic(err)
+	}
+	s = reg.ReplaceAllString(s, "")
+
+	decoded, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return decoded
+}
+
+// AssertReadReturnsBetween will call t.Fatalf if the first read from the
+// channel doesn't happen between x and y.
+func AssertReadReturnsBetween(t *testing.T, ch <-chan struct{}, x, y time.Duration) {
+	AssertReadDoesNotReturnBefore(t, ch, x)
+	// Above aborts the test if it returns before x time passed, so if we get
+	// here x time has passed.
+	AssertReadReturnsBefore(t, ch, y-x)
+}
+
+// AssertReadReturnsBefore will call t.Fatalf if the first read from the
+// channel doesn't happen before timeout.
+func AssertReadReturnsBefore(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatalf("goroutine took too long to finish")
+	}
+}
+
+// AssertChannelClosedBefore will call t.Fatalf if the first read from the
+// channel happens before timeout.
+func AssertReadDoesNotReturnBefore(t *testing.T, ch <-chan struct{}, timeout time.Duration) {
+	select {
+	case <-ch:
+		t.Fatalf("goroutine finished too quickly")
+	case <-time.After(timeout):
+	}
 }

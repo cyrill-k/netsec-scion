@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +15,8 @@
 package rctx
 
 import (
+	"time"
+
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/scionproto/scion/go/border/rcmn"
@@ -37,11 +40,8 @@ type Sock struct {
 	Conn conn.Conn
 	// Dir is the direction that a packet is being read from/written to.
 	Dir rcmn.Dir
-	// Ifids is the list of interface IDs associated with a connection.
-	Ifids []common.IFIDType
-	// LocIdx is the local address index. It is only meaningful for packets
-	// received from the local AS.
-	LocIdx int
+	// Ifid is the interface ID associated with a connection.
+	Ifid common.IFIDType
 	// Labels holds the exported prometheus labels.
 	Labels prometheus.Labels
 	// Reader is an optional function that reads from Sock.Ring. It is spawned
@@ -57,9 +57,10 @@ type Sock struct {
 }
 
 func NewSock(ring *ringbuf.Ring, conn conn.Conn, dir rcmn.Dir,
-	ifids []common.IFIDType, locIdx int, labels prometheus.Labels, reader, writer SockFunc) *Sock {
+	ifid common.IFIDType, labels prometheus.Labels, reader, writer SockFunc) *Sock {
+
 	s := &Sock{
-		Ring: ring, Conn: conn, Dir: dir, Ifids: ifids, LocIdx: locIdx, Labels: labels,
+		Ring: ring, Conn: conn, Dir: dir, Ifid: ifid, Labels: labels,
 		Reader: reader, Writer: writer, stop: make(chan struct{}),
 	}
 	if s.Reader != nil {
@@ -76,10 +77,16 @@ func NewSock(ring *ringbuf.Ring, conn conn.Conn, dir rcmn.Dir,
 func (s *Sock) Start() {
 	if !s.running {
 		if s.Reader != nil {
-			go s.Reader(s, s.stop, s.readerStopped)
+			go func() {
+				defer log.LogPanicAndExit()
+				s.Reader(s, s.stop, s.readerStopped)
+			}()
 		}
 		if s.Writer != nil {
-			go s.Writer(s, s.stop, s.writerStopped)
+			go func() {
+				defer log.LogPanicAndExit()
+				s.Writer(s, s.stop, s.writerStopped)
+			}()
 		}
 		s.running = true
 		log.Info("Sock routines started", "addr", s.Conn.LocalAddr())
@@ -91,16 +98,25 @@ func (s *Sock) Start() {
 func (s *Sock) Stop() {
 	if s.running {
 		log.Debug("Sock routines stopping", "addr", s.Conn.LocalAddr())
+		// The order of the sequence below is important:
+		// Close the Sock, which effectively only signals the Reader to finish.
 		close(s.stop)
-		s.Ring.Close()
-		if err := s.Conn.Close(); err != nil {
-			log.Error("Error stopping socket", "err", err)
+		// If there is no traffic, the Reader might be blocked reading from the socket, so
+		// unblock the reader with deadline
+		s.Conn.SetReadDeadline(time.Now())
+		if s.Reader != nil {
+			<-s.readerStopped
 		}
+		// Close the ringbuf which in turn will make the Writer to close after it has processed
+		// all packets in the ringbuf.
+		// This is the only way to signal the Writer to finish.
+		s.Ring.Close()
 		if s.Writer != nil {
 			<-s.writerStopped
 		}
-		if s.Reader != nil {
-			<-s.readerStopped
+		// Close the posix sockets.
+		if err := s.Conn.Close(); err != nil {
+			log.Error("Error stopping socket", "err", err)
 		}
 		s.running = false
 		log.Info("Sock routines stopped", "addr", s.Conn.LocalAddr())

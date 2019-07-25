@@ -18,13 +18,10 @@
 package rpkt
 
 import (
-	"github.com/scionproto/scion/go/border/rcmn"
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/assert"
 	"github.com/scionproto/scion/go/lib/common"
 	"github.com/scionproto/scion/go/lib/scmp"
 	"github.com/scionproto/scion/go/lib/spkt"
-	"github.com/scionproto/scion/go/lib/topology"
 	"github.com/scionproto/scion/go/lib/util"
 )
 
@@ -33,8 +30,6 @@ func (rp *RtrPkt) Parse() error {
 	if err := rp.parseBasic(); err != nil {
 		return err
 	}
-	// TODO(kormat): support end2end extensions where the router is the
-	// destination
 	if err := rp.parseHopExtns(); err != nil {
 		return err
 	}
@@ -63,13 +58,6 @@ func (rp *RtrPkt) Parse() error {
 	if _, err := rp.IFNext(); err != nil {
 		return err
 	}
-	if !rp.dstIA.Eq(rp.Ctx.Conf.IA) {
-		// If the destination isn't local, parse the next interface ID as well.
-		if _, err := rp.IFNext(); err != nil {
-			return err
-		}
-	}
-	rp.setDirTo()
 	return nil
 }
 
@@ -143,41 +131,7 @@ func (rp *RtrPkt) parseHopExtns() error {
 	if *offset > len(rp.Raw) {
 		// FIXME(kormat): Can't generate SCMP error in general as we can't
 		// parse anything after the hbh extensions (e.g. a layer 4 header).
-		return common.NewBasicError(ErrExtChainTooLong, nil, "curr", offset, "max", len(rp.Raw))
+		return common.NewBasicError(ErrExtChainTooLong, nil, "curr", *offset, "max", len(rp.Raw))
 	}
 	return nil
-}
-
-// setDirTo figures out which Dir a packet is going to, and sets the DirTo
-// field accordingly.
-func (rp *RtrPkt) setDirTo() {
-	if assert.On {
-		assert.Mustf(rp.DirFrom != rcmn.DirSelf, rp.ErrStr, "DirFrom must not be DirSelf.")
-		assert.Mustf(rp.DirFrom != rcmn.DirUnset, rp.ErrStr, "DirFrom must not be DirUnset.")
-		assert.Mustf(rp.ifCurr != nil, rp.ErrStr, "rp.ifCurr must not be nil.")
-	}
-	if !rp.dstIA.Eq(rp.Ctx.Conf.IA) {
-		// Packet is not destined to the local AS, so it can't be DirSelf.
-		if rp.DirFrom == rcmn.DirLocal {
-			rp.DirTo = rcmn.DirExternal
-		} else if rp.DirFrom == rcmn.DirExternal {
-			// XXX(kormat): this logic might be too simple once a router can
-			// have multiple interfaces.
-			rp.DirTo = rcmn.DirLocal
-		}
-		return
-	}
-	// Local AS is the destination, so figure out if it's DirLocal or DirSelf.
-	var taddr *topology.TopoAddr
-	if rp.DirFrom == rcmn.DirExternal {
-		taddr = rp.Ctx.Conf.Net.IFs[*rp.ifCurr].IFAddr
-	} else {
-		taddr = rp.Ctx.Conf.Net.LocAddr[rp.Ingress.LocIdx]
-	}
-	locIP := taddr.PublicAddrInfo(rp.Ingress.Dst.Overlay).IP
-	if locIP.Equal(rp.dstHost.IP()) {
-		rp.DirTo = rcmn.DirSelf
-	} else {
-		rp.DirTo = rcmn.DirLocal
-	}
 }

@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,12 +60,13 @@ const (
 	ErrorBadHostAddrType = "Unsupported host address type"
 )
 
-var (
-	SvcBS   = HostSVC(0x0000)
-	SvcPS   = HostSVC(0x0001)
-	SvcCS   = HostSVC(0x0002)
-	SvcSB   = HostSVC(0x0003)
-	SvcNone = HostSVC(0xffff)
+const (
+	SvcBS   HostSVC = 0x0000
+	SvcPS   HostSVC = 0x0001
+	SvcCS   HostSVC = 0x0002
+	SvcSB   HostSVC = 0x0003
+	SvcSIG  HostSVC = 0x0004
+	SvcNone HostSVC = 0xffff
 )
 
 type HostAddr interface {
@@ -73,11 +75,10 @@ type HostAddr interface {
 	Pack() common.RawBytes
 	IP() net.IP
 	Copy() HostAddr
+	Eq(HostAddr) bool
 	fmt.Stringer
 }
 
-// Host None type
-// *****************************************
 var _ HostAddr = (HostNone)(nil)
 
 type HostNone net.IP
@@ -102,12 +103,15 @@ func (h HostNone) Copy() HostAddr {
 	return HostNone{}
 }
 
+func (h HostNone) Eq(o HostAddr) bool {
+	_, ok := o.(HostNone)
+	return ok
+}
+
 func (h HostNone) String() string {
 	return "<None>"
 }
 
-// Host IPv4 type
-// *****************************************
 var _ HostAddr = (HostIPv4)(nil)
 
 type HostIPv4 net.IP
@@ -121,23 +125,27 @@ func (h HostIPv4) Type() HostAddrType {
 }
 
 func (h HostIPv4) Pack() common.RawBytes {
-	return common.RawBytes(net.IP(h).To4())
+	return common.RawBytes(h.IP())
 }
 
 func (h HostIPv4) IP() net.IP {
-	return net.IP(h)
+	// XXX(kormat): ensure the reply is the 4-byte representation.
+	return net.IP(h).To4()
 }
 
 func (h HostIPv4) Copy() HostAddr {
 	return HostIPv4(append(net.IP(nil), h...))
 }
 
+func (h HostIPv4) Eq(o HostAddr) bool {
+	ha, ok := o.(HostIPv4)
+	return ok && net.IP(h).Equal(net.IP(ha))
+}
+
 func (h HostIPv4) String() string {
 	return h.IP().String()
 }
 
-// Host IPv6 type
-// *****************************************
 var _ HostAddr = (HostIPv6)(nil)
 
 type HostIPv6 net.IP
@@ -162,12 +170,15 @@ func (h HostIPv6) Copy() HostAddr {
 	return HostIPv6(append(net.IP(nil), h...))
 }
 
+func (h HostIPv6) Eq(o HostAddr) bool {
+	ha, ok := o.(HostIPv6)
+	return ok && net.IP(h).Equal(net.IP(ha))
+}
+
 func (h HostIPv6) String() string {
 	return h.IP().String()
 }
 
-// Host SVC type
-// *****************************************
 var _ HostAddr = (*HostSVC)(nil)
 
 type HostSVC uint16
@@ -233,6 +244,11 @@ func (h HostSVC) Copy() HostAddr {
 	return h
 }
 
+func (h HostSVC) Eq(o HostAddr) bool {
+	ha, ok := o.(HostSVC)
+	return ok && h == ha
+}
+
 func (h HostSVC) String() string {
 	var name string
 	switch h.Base() {
@@ -270,12 +286,18 @@ func HostFromRaw(b common.RawBytes, htype HostAddrType) (HostAddr, error) {
 }
 
 func HostFromIP(ip net.IP) HostAddr {
-	if ip.To4() != nil {
-		h := HostIPv4(ip)
-		return &h
+	if ip4 := ip.To4(); ip4 != nil {
+		return HostIPv4(ip4)
 	}
-	h := HostIPv6(ip)
-	return &h
+	return HostIPv6(ip)
+}
+
+func HostFromIPStr(s string) HostAddr {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil
+	}
+	return HostFromIP(ip)
 }
 
 func HostLen(htype HostAddrType) (uint8, error) {
@@ -293,10 +315,6 @@ func HostLen(htype HostAddrType) (uint8, error) {
 		return 0, common.NewBasicError(ErrorBadHostAddrType, nil, "type", htype)
 	}
 	return length, nil
-}
-
-func HostEq(a, b HostAddr) bool {
-	return a.Type() == b.Type() && a.String() == b.String()
 }
 
 func HostTypeCheck(t HostAddrType) bool {

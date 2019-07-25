@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,13 +21,20 @@ const (
 	// SchemaVersion is the version of the SQLite schema understood by this backend.
 	// Whenever changes to the schema are made, this version number should be increased
 	// to prevent data corruption between incompatible database schemas.
-	SchemaVersion = 1
+	SchemaVersion = 7
 	// Schema is the SQLite database layout.
 	Schema = `CREATE TABLE Segments(
-		RowID INTEGER PRIMARY KEY AUTOINCREMENT,
+		RowID INTEGER PRIMARY KEY,
 		SegID DATA UNIQUE NOT NULL,
+		FullID DATA UNIQUE NOT NULL,
 		LastUpdated INTEGER NOT NULL,
-		Segment DATA NOT NULL
+		InfoTs INTEGER NOT NULL,
+		Segment DATA NOT NULL,
+		MaxExpiry INTEGER NOT NULL,
+		StartIsdID INTEGER NOT NULL,
+		StartAsID INTEGER NOT NULL,
+		EndIsdID INTEGER NOT NULL,
+		EndAsID INTEGER NOT NULL
 	);
 	CREATE TABLE IntfToSeg(
 		IsdID INTEGER NOT NULL,
@@ -35,18 +43,7 @@ const (
 		SegRowID INTEGER NOT NULL,
 		FOREIGN KEY (SegRowID) REFERENCES Segments(RowID) ON DELETE CASCADE
 	);
-	CREATE TABLE StartsAt(
-		IsdID INTEGER NOT NULL,
-		AsID INTEGER NOT NULL,
-		SegRowID INTEGER NOT NULL,
-		FOREIGN KEY (SegRowID) REFERENCES Segments(RowID) ON DELETE CASCADE
-	);
-	CREATE TABLE EndsAt(
-		IsdID INTEGER NOT NULL,
-		AsID INTEGER NOT NULL,
-		SegRowID INTEGER NOT NULL,
-		FOREIGN KEY (SegRowID) REFERENCES Segments(RowID) ON DELETE CASCADE
-	);
+	CREATE INDEX RowIdIndex ON IntfToSeg(SegRowID);
 	CREATE TABLE SegTypes(
 		SegRowID INTEGER NOT NULL,
 		Type INTEGER NOT NULL,
@@ -60,6 +57,12 @@ const (
 		CfgID INTEGER NOT NULL,
 		PRIMARY KEY (SegRowID, IsdID, AsID, CfgID) ON CONFLICT IGNORE,
 		FOREIGN KEY (SegRowID) REFERENCES Segments(RowID) ON DELETE CASCADE
+	);
+	CREATE TABLE NextQuery(
+		IsdID INTEGER NOT NULL,
+		AsID INTEGER NOT NULL,
+		NextQuery INTEGER NOT NULL,
+		PRIMARY KEY (IsdID, AsID) ON CONFLICT REPLACE
 	);`
 	SegmentsTable  = "Segments"
 	IntfToSegTable = "IntfToSeg"
@@ -67,4 +70,5 @@ const (
 	EndsAtTable    = "EndsAt"
 	SegTypesTable  = "SegTypes"
 	HpCfgIdsTable  = "HpCfgIds"
+	NextQueryTable = "NextQuery"
 )

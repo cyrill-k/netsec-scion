@@ -1,4 +1,4 @@
-// Copyright 2018 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,9 @@ import (
 	"net"
 
 	"github.com/scionproto/scion/go/lib/addr"
-	"github.com/scionproto/scion/go/lib/crypto/cert"
-	"github.com/scionproto/scion/go/lib/crypto/trc"
 	"github.com/scionproto/scion/go/lib/infra/dedupe"
+	"github.com/scionproto/scion/go/lib/scrypto/cert"
+	"github.com/scionproto/scion/go/lib/scrypto/trc"
 )
 
 var _ dedupe.Request = (*trcRequest)(nil)
@@ -34,11 +34,11 @@ type trcRequest struct {
 	version   uint64
 	cacheOnly bool
 	id        uint64
-	source    net.Addr
+	server    net.Addr
 	// If postHook is set, run the callback to verify the downloaded object and insert into
 	// the database. Also, used to generate different DedupeKeys for requests
 	// for valid vs invalid crypto.
-	postHook ValidateTRCF
+	postHook ValidateTRCFunc
 }
 
 func (req *trcRequest) DedupeKey() string {
@@ -46,7 +46,7 @@ func (req *trcRequest) DedupeKey() string {
 	// allows callers to request both verified and unverified crypto at the
 	// same (thus avoiding the case where unverified requests block verified
 	// requests from running).
-	return fmt.Sprintf("%dv%d %t %s", req.isd, req.version, req.postHook != nil, req.source)
+	return fmt.Sprintf("%dv%d %t %s", req.isd, req.version, req.postHook != nil, req.server)
 }
 
 func (req *trcRequest) BroadcastKey() string {
@@ -62,11 +62,11 @@ type chainRequest struct {
 	version   uint64
 	cacheOnly bool
 	id        uint64
-	source    net.Addr
+	server    net.Addr
 	// If postHook is set, run the callback to verify the downloaded object and insert into
 	// the database. Also, used to generate different DedupeKeys for requests
 	// for valid vs invalid crypto.
-	postHook ValidateChainF
+	postHook ValidateChainFunc
 }
 
 func (req *chainRequest) DedupeKey() string {
@@ -74,13 +74,13 @@ func (req *chainRequest) DedupeKey() string {
 	// allows callers to request both verified and unverified crypto at the
 	// same (thus avoiding the case where unverified requests block verified
 	// requests from running).
-	return fmt.Sprintf("%sv%d %t %s", req.ia, req.version, req.postHook != nil, req.source)
+	return fmt.Sprintf("%sv%d %t %s", req.ia, req.version, req.postHook != nil, req.server)
 }
 
 func (req *chainRequest) BroadcastKey() string {
 	return fmt.Sprintf("%sv%d", req.ia, req.version)
 }
 
-type ValidateTRCF func(ctx context.Context, trcObj *trc.TRC) error
+type ValidateTRCFunc func(ctx context.Context, trcObj *trc.TRC) error
 
-type ValidateChainF func(ctx context.Context, chain *cert.Chain) error
+type ValidateChainFunc func(ctx context.Context, chain *cert.Chain) error

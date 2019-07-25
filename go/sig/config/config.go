@@ -18,6 +18,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net"
 
@@ -42,6 +43,12 @@ func LoadFromFile(path string) (*Cfg, error) {
 	if err := json.Unmarshal(b, cfg); err != nil {
 		return nil, common.NewBasicError("Unable to parse SIG config", err)
 	}
+	for ia, asCfg := range cfg.ASes {
+		if asCfg == nil {
+			return nil, common.NewBasicError(
+				fmt.Sprintf("Remote AS config for %s is nil", ia), nil)
+		}
+	}
 	cfg.postprocess()
 	return cfg, nil
 }
@@ -59,6 +66,7 @@ func (cfg *Cfg) postprocess() {
 }
 
 type ASEntry struct {
+	Name string
 	Nets []*IPNet
 	Sigs SIGSet
 }
@@ -71,9 +79,13 @@ func (in *IPNet) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return common.NewBasicError("Unable to unmarshal IPnet from JSON", err, "raw", b)
 	}
-	_, ipnet, err := net.ParseCIDR(s)
+	ip, ipnet, err := net.ParseCIDR(s)
 	if err != nil {
 		return common.NewBasicError("Unable to parse IPnet string", err, "raw", s)
+	}
+	if !ip.Equal(ipnet.IP) {
+		return common.NewBasicError("Network is not canonical (should not be host address).",
+			nil, "raw", s)
 	}
 	*in = IPNet(*ipnet)
 	return nil

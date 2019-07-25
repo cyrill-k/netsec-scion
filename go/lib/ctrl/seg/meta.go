@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,33 +17,22 @@ package seg
 
 import (
 	"fmt"
+
+	"github.com/scionproto/scion/go/proto"
 )
 
 type Meta struct {
-	Type    Type
-	Segment PathSegment `capnp:"pathSeg"`
+	Type    proto.PathSegType
+	Segment *PathSegment `capnp:"pathSeg"`
+}
+
+func NewMeta(s *PathSegment, t proto.PathSegType) *Meta {
+	return &Meta{
+		Type:    t,
+		Segment: s,
+	}
 }
 
 func (m *Meta) String() string {
 	return fmt.Sprintf("Type: %v, Segment: %v", m.Type, m.Segment)
-}
-
-type Type uint16
-
-const (
-	UpSegment   Type = 0
-	DownSegment Type = 1
-	CoreSegment Type = 2
-)
-
-func (t Type) String() string {
-	switch t {
-	case UpSegment:
-		return "UP"
-	case DownSegment:
-		return "DOWN"
-	case CoreSegment:
-		return "CORE"
-	}
-	return fmt.Sprintf("UNKNOWN (%d)", t)
 }

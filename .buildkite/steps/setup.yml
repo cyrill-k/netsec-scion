@@ -1,0 +1,7 @@
+- label: Build and push scion image
+  command:
+      - $BASE/scripts/build_scion_img
+      - docker tag scion $SCION_BUILD_IMG
+      - $BASE/scripts/registry_login
+      - docker push $SCION_BUILD_IMG
+- wait

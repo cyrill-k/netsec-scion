@@ -1,4 +1,5 @@
 // Copyright 2016 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +30,7 @@ import (
 
 	"github.com/scionproto/scion/go/lib/assert"
 	"github.com/scionproto/scion/go/lib/common"
+	"github.com/scionproto/scion/go/lib/env"
 	"github.com/scionproto/scion/go/lib/log"
 	"github.com/scionproto/scion/go/lib/profile"
 )
@@ -37,6 +39,7 @@ var (
 	id       = flag.String("id", "", "Element ID (Required. E.g. 'br4-ff00:0:2f')")
 	confDir  = flag.String("confd", ".", "Configuration directory")
 	profFlag = flag.Bool("profile", false, "Enable cpu and memory profiling")
+	version  = flag.Bool("version", false, "Output version information and exit.")
 )
 
 func main() {
@@ -45,6 +48,10 @@ func main() {
 	log.AddLogFileFlags()
 	log.AddLogConsFlags()
 	flag.Parse()
+	if *version {
+		fmt.Print(env.VersionInfo())
+		os.Exit(0)
+	}
 	if *id == "" {
 		log.Crit("No element ID specified")
 		os.Exit(1)
@@ -54,7 +61,12 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	defer log.LogPanicAndExit()
+	defer env.CleanupLog()
+	if err := env.LogSvcStarted(common.BR, *id); err != nil {
+		log.Crit("LogSvcStart failed", "err", err)
+		log.Flush()
+		os.Exit(1)
+	}
 	if err := checkPerms(); err != nil {
 		log.Crit("Permissions checks failed", "err", err)
 		log.Flush()
@@ -89,8 +101,9 @@ func setupSignals() {
 	signal.Notify(sig, os.Interrupt)
 	signal.Notify(sig, syscall.SIGTERM)
 	go func() {
+		defer log.LogPanicAndExit()
 		<-sig
-		log.Info("Exiting")
+		env.LogSvcStopped(common.BR, *id)
 		profile.Stop()
 		log.Flush()
 		os.Exit(1)

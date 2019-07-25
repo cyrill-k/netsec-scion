@@ -1,4 +1,5 @@
 // Copyright 2017 ETH Zurich
+// Copyright 2018 ETH Zurich, Anapaya Systems
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +16,7 @@
 package spathmeta
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -51,16 +53,6 @@ func TestPathPredicates(t *testing.T) {
 			"1-ff00:0:133#0", true,
 		},
 		{
-			"direct neighbors, wildcard AS match",
-			"1-ff00:0:133", "1-ff00:0:132",
-			"1-0#1019", true,
-		},
-		{
-			"direct neighbors, wildcard AS but no match",
-			"1-ff00:0:133", "1-ff00:0:132",
-			"1-0#1234", false,
-		},
-		{
 			"direct neighbors, any wildcard match",
 			"1-ff00:0:133", "1-ff00:0:132",
 			"0-0#0", true,
@@ -73,17 +65,17 @@ func TestPathPredicates(t *testing.T) {
 		{
 			"far neighbors, match in the middle",
 			"1-ff00:0:122", "2-ff00:0:220",
-			"1-ff00:0:120#1215", true,
+			"1-ff00:0:120#3015", true,
 		},
 		{
 			"far neighbors, match in the middle, on egress",
 			"1-ff00:0:122", "2-ff00:0:220",
-			"1-ff00:0:120#1222", true,
+			"1-ff00:0:120#3022", true,
 		},
 		{
 			"far neighbors, match at the end",
 			"1-ff00:0:122", "2-ff00:0:220",
-			"2-ff00:0:220#2212", true,
+			"2-ff00:0:220#2230", true,
 		},
 		{
 			"far neighbors, match at the start",
@@ -98,12 +90,12 @@ func TestPathPredicates(t *testing.T) {
 		{
 			"far neighbors, match multiple with wildcards",
 			"1-ff00:0:122", "2-ff00:0:220",
-			"1-ff00:0:121#0,1-ff00:0:121#1512", true,
+			"1-ff00:0:121#0,1-ff00:0:121#1530", true,
 		},
 		{
 			"far neighbors, match multiple with wildcards and jumps",
 			"1-ff00:0:122", "2-ff00:0:220",
-			"1-ff00:0:120#1215,2-ff00:0:220#0", true,
+			"1-ff00:0:120#3015,2-ff00:0:220#0", true,
 		},
 		{
 			"far neighbors, not match with wildcard jumps",
@@ -119,8 +111,8 @@ func TestPathPredicates(t *testing.T) {
 				SoMsg("err", err, ShouldBeNil)
 				SoMsg("pp", pp, ShouldNotBeNil)
 
-				reply, err := conn.Paths(MustParseIA(tc.dst), MustParseIA(tc.src),
-					5, sciond.PathReqFlags{})
+				reply, err := conn.Paths(context.Background(), MustParseIA(tc.dst),
+					MustParseIA(tc.src), 5, sciond.PathReqFlags{})
 				SoMsg("paths err", err, ShouldBeNil)
 				SoMsg("one path only", len(reply.Entries), ShouldEqual, 1)
 
@@ -164,6 +156,7 @@ func testGetSCIONDConn(t *testing.T) sciond.Connector {
 	t.Helper()
 
 	g := graph.NewFromDescription(graph.DefaultGraphDescription)
+	g.RemoveLink(graph.If_120_B1_220_X)
 	service := sciond.NewMockService(g)
 	conn, err := service.Connect()
 	if err != nil {
