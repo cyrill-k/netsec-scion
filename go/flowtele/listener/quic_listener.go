@@ -18,6 +18,7 @@ import (
 	"github.com/scionproto/scion/go/lib/snet"
 	"github.com/scionproto/scion/go/lib/snet/squic"
 	"github.com/scionproto/scion/go/lib/sock/reliable"
+	"github.com/scionproto/scion/go/lib/log"
 )
 
 const (
@@ -69,9 +70,6 @@ func getQuicListener(lAddr *net.UDPAddr) (quic.Listener, error) {
 			return nil, fmt.Errorf("Unable to initialize SCION network (%s)", err)
 		}
 		network := snet.NewNetwork(localIA, ds, sd.RevHandler{Connector: sciondConn})
-		if err != nil {
-			return nil, fmt.Errorf("Unable to initialize SCION network (%s)", err)
-		}
 		if err = squic.Init(*keyPath, *pemPath); err != nil {
 			return nil, fmt.Errorf("Unable to load TLS server certificates: %s", err)
 		}
@@ -155,7 +153,6 @@ func listenOnStream(session quic.Session, stream quic.Stream) error {
 		totRate := float64(nTot) / tTot / 1000000.0 * 8.0
 		fmt.Printf("%d_%d cur: %.1fMBit/s (%.1fMB in %.2fs), tot: %.1fMBit/s (%.1fMB in %.2fs)\n", lPort, rPort, curRate, float64(n)/1000000, tCur, totRate, float64(nTot)/1000000, tTot)
 	}
-	return nil
 }
 
 func main() {
@@ -165,6 +162,7 @@ func main() {
 	wg.Add(*portRange * *nConnections)
 	for i := 0; i < *portRange; i++ {
 		go func(port int) {
+			defer log.HandlePanic()
 			listener, err := getQuicListener(&net.UDPAddr{IP: net.ParseIP(*listenAddr), Port: port})
 			if err != nil {
 				errs <- fmt.Errorf("Error starting QUIC listener: %s", err)
@@ -179,6 +177,7 @@ func main() {
 					return
 				}
 				go func(se quic.Session, st quic.Stream) {
+					defer log.HandlePanic()
 					defer wg.Done()
 					if err := listenOnStream(se, st); err != nil {
 						errs <- err
@@ -189,6 +188,7 @@ func main() {
 	}
 	closeChannel := make(chan struct{})
 	go func() {
+		defer log.HandlePanic()
 		wg.Wait()
 		close(closeChannel)
 	}()

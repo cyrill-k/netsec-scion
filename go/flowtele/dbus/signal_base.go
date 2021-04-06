@@ -67,7 +67,7 @@ func (s *dbusSignalStruct) IntrospectSignal() introspect.Signal {
 	var arg_list []introspect.Arg
 	t := reflect.TypeOf(s.Value)
 	for i := 0; i < t.NumField(); i++ {
-		arg_list = append(arg_list, introspect.Arg{t.Field(i).Name, dbus.SignatureOfType(t.Field(i).Type).String(), "out"})
+		arg_list = append(arg_list, introspect.Arg{Name: t.Field(i).Name, Type: dbus.SignatureOfType(t.Field(i).Type).String(), Direction: "out"})
 	}
 	return introspect.Signal{Name: s.Name(), Args: arg_list}
 }
