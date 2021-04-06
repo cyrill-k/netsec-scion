@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+# parallel-ssh -h hosts 'mkdir -p /home/cyrill/go/src/github.com/scionproto/scion/'
+parallel-rsync -e err -o out -h hosts -r -a -v -x "--exclude .git" -x "--exclude .bazel-cache" -x "-L" -x "--include bazel-bin/go/flowtele/***" -x "--include bazel-bin/go/examples/pingpong/***" -x "--include */" -x "--exclude bazel-bin/***" -x "--exclude bazel-out/***" -x "--exclude bazel-scion/***" -x "--prune-empty-dirs" /home/cyrill/go/src/github.com/scionproto/scion /home/cyrill/go/src/github.com/scionproto/
+# rsync -r -v --exclude ".git" --exclude ".bazel-cache" -L --include "bazel-bin/go/flowtele/***" --include "bazel-bin/go/examples/pingpong/***" --include "*/" --exclude "bazel-bin/***" --exclude "bazel-out/***" --exclude "bazel-scion/***" --prune-empty-dirs /home/cyrill/go/src/github.com/scionproto/scion flowtele-ohio:/home/cyrill/go/src/github.com/scionproto/
+
+parallel-ssh -h hosts 'mkdir -p /home/cyrill/bitbucket/csl331/'
+parallel-rsync -h hosts -r -x "--exclude .git" /home/cyrill/bitbucket/csl331 /home/cyrill/bitbucket
