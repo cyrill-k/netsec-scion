@@ -80,7 +80,7 @@ func main() {
 	} else if *mode == "fetch" {
 		go func(cc chan struct{}, ec chan error) {
 			defer log.HandlePanic()
-			invokePathFetching(closeChannel, errChannel)
+			invokePathFetching(cc, ec)
 		}(closeChannel, errChannel)
 	} else {
 		flag.PrintDefaults()
